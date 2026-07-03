@@ -4,7 +4,12 @@ from pydantic import BaseModel
 from typing import Optional
 import uuid
 import asyncio
+import logging
 from datetime import datetime
+
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 from .ocr_service import process_image, extract_barcodes
 from .parsers.sng_parser import parse_sng_invoice, to_dict as sng_to_dict
@@ -121,6 +126,15 @@ async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
         # OCR 처리
         raw_text = process_image(image_data)
 
+        # 디버그: 전체 OCR 텍스트 로그 출력
+        logger.info("=" * 80)
+        logger.info("SNG OCR - FULL RAW TEXT START")
+        logger.info("=" * 80)
+        logger.info(raw_text)
+        logger.info("=" * 80)
+        logger.info(f"SNG OCR - FULL RAW TEXT END (Total: {len(raw_text)} chars)")
+        logger.info("=" * 80)
+
         # SNG 파서로 구조화된 데이터 추출
         result = parse_sng_invoice(raw_text)
 
@@ -142,9 +156,11 @@ async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
                 for item in result.line_items
             ],
             "line_item_count": len(result.line_items),
-            "raw_text_preview": raw_text[:500] if raw_text else ""
+            "raw_text_preview": raw_text[:500] if raw_text else "",
+            "raw_text_full": raw_text  # 디버그용 전체 텍스트
         }
     except Exception as e:
+        logger.error(f"SNG OCR Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
