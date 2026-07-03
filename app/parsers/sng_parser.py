@@ -5,11 +5,30 @@ SNG (Shake-N-Go) 인보이스 파서
 - 헤더: Invoice NO, Invoice Date
 - 라인 아이템: ITEM NUMBER, Description, 색상-수량 쌍 (4열), 단가
 - 색상-수량 쌍은 여러 줄에 걸쳐 4열로 배치됨
+
+SNG 아이템 코드 형식:
+- S로 시작 (SFTWB14, SODWX24, SOHWXL3 등)
+- 5-8자리
+- OCR 오인식 보정: I→1, O→0, Y→4
 """
 
 import re
+import logging
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
+
+
+# OCR 문자 보정 맵 (자주 오인식되는 문자)
+OCR_CHAR_CORRECTIONS = {
+    'I': '1',  # I → 1 (아이템 코드 내 숫자)
+    'O': '0',  # O → 0
+    'Y': '4',  # Y → 4 (SFTWBIY → SFTWB14)
+    'S': '5',  # S → 5 (숫자 위치에서만)
+    'B': '8',  # B → 8 (숫자 위치에서만)
+    'G': '6',  # G → 6
+}
 
 
 @dataclass
@@ -32,6 +51,42 @@ class SngInvoiceResult:
     header: SngInvoiceHeader
     line_items: List[SngLineItem]
     raw_text: str
+
+
+def correct_ocr_item_code(code: str) -> str:
+    """
+    OCR 오인식 문자를 보정하여 올바른 아이템 코드 반환
+
+    예: SFTWBIY → SFTWB14
+        soDwx24 → SODWX24
+    """
+    # 대문자로 정규화
+    code = code.upper()
+
+    # SNG 아이템 코드 구조: S + 알파벳(2-4자) + 숫자(1-3자) + 옵션
+    # 예: SFTWB14, SODWX24, SOHWXL3
+
+    # 마지막 부분이 숫자여야 하는 경우 보정
+    # 보통 알파벳 뒤 숫자 부분에서 오인식 발생
+    result = list(code)
+
+    # 끝에서부터 숫자가 있어야 할 위치 찾기
+    # SNG 패턴: S[A-Z]{2,4}[A-Z]?[0-9]{1,2}
+    # 예: SFTWB + 14, SODWX + 24
+
+    # 마지막 1-2자리가 숫자여야 함
+    for i in range(len(result) - 1, max(len(result) - 3, 3), -1):
+        char = result[i]
+        if char in OCR_CHAR_CORRECTIONS and not char.isdigit():
+            # 숫자로 보정
+            result[i] = OCR_CHAR_CORRECTIONS[char]
+            logger.debug(f"OCR 보정: {code}[{i}] '{char}' → '{result[i]}'")
+
+    corrected = ''.join(result)
+    if corrected != code:
+        logger.info(f"OCR 아이템 코드 보정: {code} → {corrected}")
+
+    return corrected
 
 
 def parse_sng_invoice(text: str) -> SngInvoiceResult:
@@ -85,6 +140,11 @@ def extract_header(text: str) -> SngInvoiceHeader:
 def extract_line_items(text: str) -> List[SngLineItem]:
     """
     라인 아이템 추출 (ITEM NUMBER + COLOR + QUANTITY)
+
+    SNG 아이템 코드 특징:
+    - S로 시작 (SFTWB14, SODWX24, SOHWXL3)
+    - 5-8자리 길이
+    - OCR에서 대소문자 혼용 가능 (soDwx24 등)
     """
     line_items = []
     lines = text.split('\n')
@@ -93,8 +153,10 @@ def extract_line_items(text: str) -> List[SngLineItem]:
     current_description = None
     current_unit_price = None
 
-    # ITEM NUMBER 패턴: 대문자+숫자 조합 (예: SFTWB14, SODWX24, SOHWXL3)
-    item_code_pattern = r'\b([A-Z]{1,4}[A-Z0-9]{2,10})\b'
+    # SNG 아이템 코드 패턴 (S로 시작, 5-8자)
+    # 대소문자 무시, OCR 오인식 고려
+    # 예: SFTWB14, soDwx24, SOHWXL3, SFTWBIY(→SFTWB14)
+    item_code_pattern = r'\b([Ss][A-Za-z]{2,5}[A-Za-z0-9]{1,3})\b'
 
     # 색상-수량 패턴: "COLOR - QTY" 또는 "NUMBER - NUMBER"
     # 예: COPPER - 2, 1B - 4, P1B/30 - 2, ASH-LATTE - 12
@@ -104,37 +166,49 @@ def extract_line_items(text: str) -> List[SngLineItem]:
     price_pattern = r'\b(\d{1,3}\.\d{2})\b'
 
     for i, line in enumerate(lines):
-        line = line.strip()
-        if not line:
+        original_line = line.strip()
+        if not original_line:
             continue
+
+        # 대문자로 정규화 (비교용)
+        line_upper = original_line.upper()
 
         # ITEM NUMBER 찾기 (PACKED BY, QTY 등의 헤더 행 제외)
-        if re.search(r'(PACKED|ORDERED|SHIPPED|DESCRIPTION|PRICE|EXTENDED)', line, re.IGNORECASE):
+        if re.search(r'(PACKED|ORDERED|SHIPPED|DESCRIPTION|PRICE|EXTENDED)', line_upper):
             continue
 
-        # ITEM NUMBER 추출
-        item_match = re.search(item_code_pattern, line)
+        # SNG 아이템 코드 추출 (대소문자 무시)
+        item_match = re.search(item_code_pattern, original_line, re.IGNORECASE)
         if item_match:
-            potential_item = item_match.group(1)
+            potential_item = item_match.group(1).upper()
+
             # 유효한 ITEM CODE인지 확인 (헤더 텍스트 제외)
-            if not is_header_text(potential_item):
+            if not is_header_text(potential_item) and potential_item.startswith('S'):
+                # OCR 오인식 보정 적용
+                corrected_item = correct_ocr_item_code(potential_item)
+
                 # 새 아이템 시작
-                current_item_code = potential_item
+                current_item_code = corrected_item
+                logger.debug(f"아이템 코드 감지: {potential_item} → {current_item_code}")
 
                 # Description 추출 (ITEM CODE 뒤의 텍스트)
-                desc_match = re.search(rf'{re.escape(current_item_code)}\s+(.+?)(?:\d{{1,3}}\.\d{{2}}|$)', line)
+                desc_match = re.search(
+                    rf'{re.escape(item_match.group(1))}\s+(.+?)(?:\d{{1,3}}\.\d{{2}}|$)',
+                    original_line,
+                    re.IGNORECASE
+                )
                 if desc_match:
                     current_description = desc_match.group(1).strip()
 
                 # 단가 추출
-                prices = re.findall(price_pattern, line)
+                prices = re.findall(price_pattern, original_line)
                 if prices:
                     # Your Price는 보통 두 번째 가격 (List Price 다음)
                     current_unit_price = float(prices[-1]) if len(prices) >= 1 else None
 
         # 색상-수량 쌍 추출
         if current_item_code:
-            color_qty_matches = re.findall(color_qty_pattern, line, re.IGNORECASE)
+            color_qty_matches = re.findall(color_qty_pattern, line_upper)
 
             for match in color_qty_matches:
                 color = match[0].strip()
@@ -151,6 +225,7 @@ def extract_line_items(text: str) -> List[SngLineItem]:
                         description=current_description
                     ))
 
+    logger.info(f"추출된 라인 아이템 수: {len(line_items)}")
     return line_items
 
 
