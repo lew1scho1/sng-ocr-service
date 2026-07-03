@@ -7,6 +7,7 @@ import asyncio
 from datetime import datetime
 
 from .ocr_service import process_image, extract_barcodes
+from .parsers.sng_parser import parse_sng_invoice, to_dict as sng_to_dict
 
 app = FastAPI(
     title="SNG OCR Service",
@@ -86,6 +87,7 @@ async def create_ocr_job(
 async def create_ocr_job_sync(file: UploadFile = File(...)):
     """
     OCR 작업 (동기 처리 - 즉시 결과 반환)
+    바코드 패턴(12-14자리 숫자)만 추출
     """
     try:
         image_data = await file.read()
@@ -98,6 +100,48 @@ async def create_ocr_job_sync(file: UploadFile = File(...)):
             "success": True,
             "barcodes": barcodes,
             "barcode_count": len(barcodes),
+            "raw_text_preview": raw_text[:500] if raw_text else ""
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/ocr/jobs/sync/sng")
+async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
+    """
+    SNG (Shake-N-Go) 인보이스 전용 OCR
+
+    추출 정보:
+    - 헤더: Invoice NO, Invoice Date
+    - 라인 아이템: ITEM_CODE + COLOR + QUANTITY + UNIT_PRICE
+    """
+    try:
+        image_data = await file.read()
+
+        # OCR 처리
+        raw_text = process_image(image_data)
+
+        # SNG 파서로 구조화된 데이터 추출
+        result = parse_sng_invoice(raw_text)
+
+        return {
+            "success": True,
+            "company": "SNG",
+            "header": {
+                "invoice_number": result.header.invoice_number,
+                "invoice_date": result.header.invoice_date
+            },
+            "line_items": [
+                {
+                    "item_code": item.item_code,
+                    "color": item.color,
+                    "quantity": item.quantity,
+                    "unit_price": item.unit_price,
+                    "description": item.description
+                }
+                for item in result.line_items
+            ],
+            "line_item_count": len(result.line_items),
             "raw_text_preview": raw_text[:500] if raw_text else ""
         }
     except Exception as e:
