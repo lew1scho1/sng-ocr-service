@@ -141,10 +141,13 @@ def extract_line_items(text: str) -> List[SngLineItem]:
     """
     라인 아이템 추출 (ITEM NUMBER + COLOR + QUANTITY)
 
-    SNG 아이템 코드 특징:
-    - S로 시작 (SFTWB14, SODWX24, SOHWXL3)
-    - 5-8자리 길이
-    - OCR에서 대소문자 혼용 가능 (soDwx24 등)
+    SNG 인보이스 라인 구조:
+    [PackedBy] [OrderQty] [ShipQty] [ITEM_CODE] [Description(2자)] [나머지...]
+    예: F71    3         2         SFTWB14     HR FREETRESS WATER...
+
+    ITEM CODE 특징:
+    - 앞에 숫자(수량)가 있음
+    - 뒤에 2자리 영문 설명 코드가 있음 (HR, OG 등)
     """
     line_items = []
     lines = text.split('\n')
@@ -153,14 +156,16 @@ def extract_line_items(text: str) -> List[SngLineItem]:
     current_description = None
     current_unit_price = None
 
-    # SNG 아이템 코드 패턴 (S로 시작, 5-8자)
-    # 대소문자 무시, OCR 오인식 고려
-    # 예: SFTWB14, soDwx24, SOHWXL3, SFTWBIY(→SFTWB14)
-    item_code_pattern = r'\b([Ss][A-Za-z]{2,5}[A-Za-z0-9]{1,3})\b'
+    # 컨텍스트 기반 아이템 코드 패턴
+    # 패턴: [숫자] [숫자] [ITEM_CODE] [영문2자]
+    # 예: 3 2 SFTWB14 HR, 12 12 SODWX24 OG
+    item_line_pattern = r'\d+\s+\d+\s+([A-Za-z0-9]{5,9})\s+([A-Z]{2})\s'
 
-    # 색상-수량 패턴: "COLOR - QTY" 또는 "NUMBER - NUMBER"
+    # 색상-수량 패턴: "COLOR - QTY"
+    # 핵심: 색상명 내부 하이픈(ASH-LATTE)은 공백 없음
+    #       색상과 수량 사이 대시는 양쪽 공백 필수 (ASH-LATTE - 12)
     # 예: COPPER - 2, 1B - 4, P1B/30 - 2, ASH-LATTE - 12
-    color_qty_pattern = r'([A-Z0-9][A-Z0-9/\-]*)\s*[-–—]\s*(\d{1,3})(?:\s*\((\d+)\))?'
+    color_qty_pattern = r'([A-Z0-9][A-Z0-9/-]*[A-Z0-9]|[A-Z0-9])\s+[-–—]\s+(\d{1,3})(?:\s*\((\d+)\))?'
 
     # 단가 패턴: 소수점 두자리 숫자 (예: 32.00, 17.00)
     price_pattern = r'\b(\d{1,3}\.\d{2})\b'
@@ -177,34 +182,35 @@ def extract_line_items(text: str) -> List[SngLineItem]:
         if re.search(r'(PACKED|ORDERED|SHIPPED|DESCRIPTION|PRICE|EXTENDED)', line_upper):
             continue
 
-        # SNG 아이템 코드 추출 (대소문자 무시)
-        item_match = re.search(item_code_pattern, original_line, re.IGNORECASE)
+        # 컨텍스트 기반 아이템 코드 추출
+        # 패턴: [숫자] [숫자] [ITEM_CODE] [영문2자]
+        item_match = re.search(item_line_pattern, line_upper)
         if item_match:
             potential_item = item_match.group(1).upper()
+            desc_prefix = item_match.group(2)  # HR, OG 등
 
-            # 유효한 ITEM CODE인지 확인 (헤더 텍스트 제외)
-            if not is_header_text(potential_item) and potential_item.startswith('S'):
-                # OCR 오인식 보정 적용
-                corrected_item = correct_ocr_item_code(potential_item)
+            # OCR 오인식 보정 적용
+            corrected_item = correct_ocr_item_code(potential_item)
 
-                # 새 아이템 시작
-                current_item_code = corrected_item
-                logger.debug(f"아이템 코드 감지: {potential_item} → {current_item_code}")
+            # 새 아이템 시작
+            current_item_code = corrected_item
+            logger.info(f"아이템 코드 감지: {potential_item} → {current_item_code} (설명: {desc_prefix})")
 
-                # Description 추출 (ITEM CODE 뒤의 텍스트)
-                desc_match = re.search(
-                    rf'{re.escape(item_match.group(1))}\s+(.+?)(?:\d{{1,3}}\.\d{{2}}|$)',
-                    original_line,
-                    re.IGNORECASE
-                )
-                if desc_match:
-                    current_description = desc_match.group(1).strip()
+            # Description 추출 (2자리 코드 뒤의 텍스트)
+            desc_match = re.search(
+                rf'{re.escape(desc_prefix)}\s+(.+?)(?:\d{{1,3}}\.\d{{2}}|$)',
+                line_upper
+            )
+            if desc_match:
+                current_description = f"{desc_prefix} {desc_match.group(1).strip()}"
+            else:
+                current_description = desc_prefix
 
-                # 단가 추출
-                prices = re.findall(price_pattern, original_line)
-                if prices:
-                    # Your Price는 보통 두 번째 가격 (List Price 다음)
-                    current_unit_price = float(prices[-1]) if len(prices) >= 1 else None
+            # 단가 추출
+            prices = re.findall(price_pattern, original_line)
+            if prices:
+                # Your Price는 보통 두 번째 가격 (List Price 다음)
+                current_unit_price = float(prices[-1]) if len(prices) >= 1 else None
 
         # 색상-수량 쌍 추출
         if current_item_code:
