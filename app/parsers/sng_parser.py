@@ -10,25 +10,27 @@ SNG 아이템 코드 형식:
 - S로 시작 (SFTWB14, SODWX24, SOHWXL3 등)
 - 5-8자리
 - OCR 오인식 보정: I→1, O→0, Y→4
+
+가격 구조 (2줄):
+- 첫 줄: List Price / List Extended
+- 둘째 줄: Your Price / Your Extended / Discounted Amount
 """
 
 import re
 import logging
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
+from enum import Enum, auto
 
 logger = logging.getLogger(__name__)
 
 
-# OCR 문자 보정 맵 (자주 오인식되는 문자)
-OCR_CHAR_CORRECTIONS = {
-    'I': '1',  # I → 1 (아이템 코드 내 숫자)
-    'O': '0',  # O → 0
-    'Y': '4',  # Y → 4 (SFTWBIY → SFTWB14)
-    'S': '5',  # S → 5 (숫자 위치에서만)
-    'B': '8',  # B → 8 (숫자 위치에서만)
-    'G': '6',  # G → 6
-}
+class ParserState(Enum):
+    """파서 상태 머신"""
+    IDLE = auto()           # 아이템 찾는 중
+    ITEM_START = auto()     # 아이템 시작 (첫 줄 가격)
+    PRICE_LINE = auto()     # 가격 둘째 줄 (Your Price)
+    COLOR_COLLECT = auto()  # 색상-수량 수집 중
 
 
 @dataclass
@@ -51,6 +53,46 @@ class SngInvoiceResult:
     header: SngInvoiceHeader
     line_items: List[SngLineItem]
     raw_text: str
+    # 멀티 페이지 지원: 다음 페이지 처리 시 사용
+    last_item_code: Optional[str] = None
+    last_unit_price: Optional[float] = None
+
+
+def normalize_line(line: str) -> str:
+    """
+    OCR 오류를 정규화하여 파싱 가능한 형태로 변환
+
+    적용 순서가 중요:
+    1. 특수문자 제거: « » 등
+    2. 0/O 보정: 아이템 코드 뒤 설명 코드에서 0G → OG
+    3. 쉼표 보정: 가격의 74,08 → 74.08
+    4. 가격 0→8 오인식 보정: .08 → .00, .88 → .00
+    5. 공백 정규화: 다중 공백 → 단일 공백
+    """
+    # 1. 특수문자 제거
+    line = re.sub(r'[«»]', '', line)
+
+    # 2. 아이템 코드 뒤 설명 코드에서 0G → OG, (0G → OG
+    line = re.sub(r'\(0G\b', 'OG', line)
+    line = re.sub(r'\b0G\b', 'OG', line)
+
+    # 3. 가격 내 쉼표를 점으로 변환
+    line = re.sub(r'(\d+),(\d{2})\b', r'\1.\2', line)
+
+    # 4. 가격 OCR 오류 보정 (0이 8로 오인식)
+    # SNG 가격은 .00으로 끝남: 17.08 → 17.00, 32.88 → 32.00
+    def fix_price_ocr(match):
+        price = match.group(0)
+        cents = price[-2:]
+        if cents in ('08', '80', '88'):
+            return price[:-2] + '00'
+        return price
+    line = re.sub(r'\d+\.\d{2}\b', fix_price_ocr, line)
+
+    # 5. 다중 공백 정규화
+    line = re.sub(r'\s+', ' ', line)
+
+    return line.strip()
 
 
 def correct_ocr_item_code(code: str) -> str:
@@ -60,26 +102,17 @@ def correct_ocr_item_code(code: str) -> str:
     예: SFTWBIY → SFTWB14
         soDwx24 → SODWX24
     """
-    # 대문자로 정규화
     code = code.upper()
-
-    # SNG 아이템 코드 구조: S + 알파벳(2-4자) + 숫자(1-3자) + 옵션
-    # 예: SFTWB14, SODWX24, SOHWXL3
-
-    # 마지막 부분이 숫자여야 하는 경우 보정
-    # 보통 알파벳 뒤 숫자 부분에서 오인식 발생
     result = list(code)
 
-    # 끝에서부터 숫자가 있어야 할 위치 찾기
-    # SNG 패턴: S[A-Z]{2,4}[A-Z]?[0-9]{1,2}
-    # 예: SFTWB + 14, SODWX + 24
+    # 끝에서 1-2자리가 숫자여야 함
+    # Y→4, I→1, O→0 보정
+    ocr_to_digit = {'Y': '4', 'I': '1', 'O': '0'}
 
-    # 마지막 1-2자리가 숫자여야 함
     for i in range(len(result) - 1, max(len(result) - 3, 3), -1):
         char = result[i]
-        if char in OCR_CHAR_CORRECTIONS and not char.isdigit():
-            # 숫자로 보정
-            result[i] = OCR_CHAR_CORRECTIONS[char]
+        if char in ocr_to_digit:
+            result[i] = ocr_to_digit[char]
             logger.debug(f"OCR 보정: {code}[{i}] '{char}' → '{result[i]}'")
 
     corrected = ''.join(result)
@@ -89,128 +122,206 @@ def correct_ocr_item_code(code: str) -> str:
     return corrected
 
 
-def parse_sng_invoice(text: str) -> SngInvoiceResult:
+def parse_sng_invoice(text: str, prev_item_code: Optional[str] = None,
+                      prev_unit_price: Optional[float] = None) -> SngInvoiceResult:
     """
     SNG 인보이스 OCR 텍스트를 파싱하여 구조화된 데이터 반환
+
+    Args:
+        text: OCR 텍스트
+        prev_item_code: 이전 페이지의 마지막 아이템 코드 (멀티 페이지 지원)
+        prev_unit_price: 이전 페이지의 마지막 단가
+
+    Returns:
+        SngInvoiceResult: 파싱 결과 (last_item_code, last_unit_price 포함)
     """
     header = extract_header(text)
-    line_items = extract_line_items(text)
+    line_items = extract_line_items(text, prev_item_code, prev_unit_price)
+
+    # 마지막 아이템 정보 추출 (다음 페이지 연결용)
+    last_item_code = None
+    last_unit_price = None
+    if line_items:
+        last_item = line_items[-1]
+        last_item_code = last_item.item_code
+        last_unit_price = last_item.unit_price
 
     return SngInvoiceResult(
         header=header,
         line_items=line_items,
-        raw_text=text[:1000] if text else ""
+        raw_text=text[:1000] if text else "",
+        last_item_code=last_item_code,
+        last_unit_price=last_unit_price
     )
 
 
 def extract_header(text: str) -> SngInvoiceHeader:
     """
     헤더 정보 추출 (Invoice NO, Invoice Date)
+
+    날짜 추출 우선순위:
+    1. INVOICE DATE 레이블 근처 날짜
+    2. 문서 상단 첫 번째 유효 날짜
     """
     header = SngInvoiceHeader()
 
+    # 텍스트 정규화 (날짜 내 특수문자 보정)
+    normalized_text = text
+    # 07/€2/2026 같은 OCR 노이즈 보정
+    normalized_text = re.sub(r'(\d{1,2})/[€$@#](\d)/(\d{4})', r'\1/0\2/\3', normalized_text)
+
     # Invoice NO 추출 (10자리 숫자)
-    # 패턴: "Invoice NO." 또는 "Invoice NO" 다음에 오는 숫자
     invoice_no_patterns = [
-        r'Invoice\s*(?:NO\.?|#)\s*(\d{10})',  # Invoice NO. 3000674313
-        r'(\d{10})\s*$',  # 줄 끝의 10자리 숫자
+        r'Invoice\s*(?:NO\.?|#)\s*(\d{10})',
+        r'(\d{10})',  # 10자리 숫자
     ]
 
     for pattern in invoice_no_patterns:
-        match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+        match = re.search(pattern, normalized_text, re.IGNORECASE)
         if match:
             header.invoice_number = match.group(1)
             break
 
-    # Invoice Date 추출 (MM/DD/YYYY 형식)
-    date_patterns = [
-        r'INVOICE\s*DATE\s*(\d{1,2}/\d{1,2}/\d{4})',  # INVOICE DATE 07/02/2026
-        r'(\d{1,2}/\d{1,2}/\d{4})',  # 일반 날짜 패턴
-    ]
+    # Invoice Date 추출 - 우선순위 적용
+    lines = normalized_text.split('\n')
 
-    for pattern in date_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            header.invoice_date = match.group(1)
-            break
+    # 1순위: INVOICE DATE 레이블이 있는 줄 또는 바로 아래 줄
+    for i, line in enumerate(lines[:25]):  # 상단 25줄 확인
+        if 'INVOICE' in line.upper() and 'DATE' in line.upper():
+            # 같은 줄에서 날짜 찾기
+            date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', line)
+            if date_match:
+                header.invoice_date = date_match.group(1)
+                break
+            # 다음 줄에서 날짜 찾기
+            if i + 1 < len(lines):
+                date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', lines[i + 1])
+                if date_match:
+                    header.invoice_date = date_match.group(1)
+                    break
+
+    # 2순위: 상단 10줄 내 첫 번째 날짜 (INVOICE DATE 못 찾은 경우)
+    if not header.invoice_date:
+        for line in lines[:10]:
+            date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', line)
+            if date_match:
+                header.invoice_date = date_match.group(1)
+                break
 
     return header
 
 
-def extract_line_items(text: str) -> List[SngLineItem]:
+def extract_line_items(text: str, prev_item_code: Optional[str] = None,
+                        prev_unit_price: Optional[float] = None) -> List[SngLineItem]:
     """
-    라인 아이템 추출 (ITEM NUMBER + COLOR + QUANTITY)
+    라인 아이템 추출 - 상태 기반 파서
 
-    SNG 인보이스 라인 구조:
-    [PackedBy] [OrderQty] [ShipQty] [ITEM_CODE] [Description(2자)] [나머지...]
-    예: F71    3         2         SFTWB14     HR FREETRESS WATER...
+    SNG 인보이스 구조:
+    Line 1: [PackedBy] [OrderQty] [ShipQty] [ITEM_CODE] [Desc] [ListPrice] [ListExtended]
+    Line 2: [YourPrice] [YourExtended] [Discount]
+    Line 3+: [Color-Qty] [Color-Qty] [Color-Qty] [Color-Qty]
 
-    ITEM CODE 특징:
-    - 앞에 숫자(수량)가 있음
-    - 뒤에 2자리 영문 설명 코드가 있음 (HR, OG 등)
+    멀티 페이지 지원:
+    - prev_item_code: 이전 페이지의 마지막 아이템 코드
+    - prev_unit_price: 이전 페이지의 마지막 단가
+    - 페이지 시작 시 아이템 코드 없이 색상만 있으면 prev_item_code에 연결
+
+    상태 흐름:
+    IDLE → ITEM_START (아이템 코드 발견, List Price 줄)
+    ITEM_START → PRICE_LINE (Your Price 줄)
+    PRICE_LINE → COLOR_COLLECT (색상-수량 수집)
+    COLOR_COLLECT → ITEM_START (다음 아이템) 또는 계속 수집
     """
     line_items = []
     lines = text.split('\n')
 
-    current_item_code = None
+    # 현재 아이템 컨텍스트 (이전 페이지에서 이어받기)
+    current_item_code = prev_item_code
     current_description = None
-    current_unit_price = None
+    current_unit_price = prev_unit_price
+    current_ship_qty = 0
+    current_has_colors = False
+    state = ParserState.COLOR_COLLECT if prev_item_code else ParserState.IDLE
 
-    # 컨텍스트 기반 아이템 코드 패턴
-    # 패턴: [숫자] [숫자] [ITEM_CODE] [영문2자]
-    # 예: 3 2 SFTWB14 HR, 12 12 SODWX24 OG
-    item_line_pattern = r'\d+\s+\d+\s+([A-Za-z0-9]{5,9})\s+([A-Z]{2})\s'
+    # 아이템 코드 패턴 (숫자 앞 노이즈 허용)
+    item_line_pattern = r'(?:^|\s)(\d+)\s+(\d+)\s+([A-Za-z][A-Za-z0-9]{4,8})\s+([A-Z]{2})\b'
 
-    # 색상-수량 패턴: "COLOR - QTY"
-    # 핵심: 색상명 내부 하이픈(ASH-LATTE)은 공백 없음
-    #       색상과 수량 사이 대시는 양쪽 공백 필수 (ASH-LATTE - 12)
-    # 예: COPPER - 2, 1B - 4, P1B/30 - 2, ASH-LATTE - 12
-    color_qty_pattern = r'([A-Z0-9][A-Z0-9/-]*[A-Z0-9]|[A-Z0-9])\s+[-–—]\s+(\d{1,3})(?:\s*\((\d+)\))?'
+    # 색상-수량 패턴 (대시 양옆 공백 optional)
+    # C-42730 - 4, P27/30 - 6 같은 복합 색상 코드 지원
+    color_qty_pattern = r'([A-Z0-9][A-Z0-9/]*(?:-[A-Z0-9]+)?)\s*[-–—]\s*(\d{1,3})(?:\s*\((\d+)\))?'
 
-    # 단가 패턴: 소수점 두자리 숫자 (예: 32.00, 17.00)
-    price_pattern = r'\b(\d{1,3}\.\d{2})\b'
+    # 가격 패턴
+    price_pattern = r'(\d{1,3}\.\d{2})'
+
+    def save_item_if_no_colors():
+        """색상 정보 없는 아이템 저장 (ship_qty를 quantity로 사용)"""
+        nonlocal current_has_colors
+        if current_item_code and not current_has_colors:
+            line_items.append(SngLineItem(
+                item_code=current_item_code,
+                color="",  # 색상 없음
+                quantity=current_ship_qty,
+                unit_price=current_unit_price,
+                description=current_description
+            ))
+            logger.info(f"색상 없는 아이템 추가: {current_item_code}, qty={current_ship_qty}")
 
     for i, line in enumerate(lines):
         original_line = line.strip()
         if not original_line:
             continue
 
-        # 대문자로 정규화 (비교용)
-        line_upper = original_line.upper()
+        # 라인 정규화 적용
+        normalized_line = normalize_line(original_line)
+        line_upper = normalized_line.upper()
 
-        # ITEM NUMBER 찾기 (PACKED BY, QTY 등의 헤더 행 제외)
-        if re.search(r'(PACKED|ORDERED|SHIPPED|DESCRIPTION|PRICE|EXTENDED)', line_upper):
+        # 헤더 행 제외
+        if re.search(r'\b(PACKED|ORDERED|SHIPPED|DESCRIPTION|PRICE|EXTENDED|ITEM\s*NUMBER)\b', line_upper):
             continue
 
-        # 컨텍스트 기반 아이템 코드 추출
-        # 패턴: [숫자] [숫자] [ITEM_CODE] [영문2자]
+        # 아이템 코드 찾기
         item_match = re.search(item_line_pattern, line_upper)
         if item_match:
-            potential_item = item_match.group(1).upper()
-            desc_prefix = item_match.group(2)  # HR, OG 등
+            order_qty = item_match.group(1)
+            ship_qty = item_match.group(2)
+            potential_item = item_match.group(3).upper()
+            desc_prefix = item_match.group(4)
 
-            # OCR 오인식 보정 적용
-            corrected_item = correct_ocr_item_code(potential_item)
+            # S로 시작하는 SNG 아이템 코드인지 확인
+            if potential_item.startswith('S'):
+                # 이전 아이템이 색상 없으면 저장
+                save_item_if_no_colors()
 
-            # 새 아이템 시작
-            current_item_code = corrected_item
-            logger.info(f"아이템 코드 감지: {potential_item} → {current_item_code} (설명: {desc_prefix})")
+                corrected_item = correct_ocr_item_code(potential_item)
 
-            # Description 추출 (2자리 코드 뒤의 텍스트)
-            desc_match = re.search(
-                rf'{re.escape(desc_prefix)}\s+(.+?)(?:\d{{1,3}}\.\d{{2}}|$)',
-                line_upper
-            )
-            if desc_match:
-                current_description = f"{desc_prefix} {desc_match.group(1).strip()}"
-            else:
-                current_description = desc_prefix
+                # 새 아이템 시작
+                current_item_code = corrected_item
+                current_unit_price = None
+                current_ship_qty = int(ship_qty)
+                current_has_colors = False
+                state = ParserState.ITEM_START
 
-            # 단가 추출
-            prices = re.findall(price_pattern, original_line)
-            if prices:
-                # Your Price는 보통 두 번째 가격 (List Price 다음)
-                current_unit_price = float(prices[-1]) if len(prices) >= 1 else None
+                logger.info(f"아이템 코드 감지: {potential_item} → {current_item_code} (Qty: {order_qty}/{ship_qty}, 설명: {desc_prefix})")
+
+                # Description 추출
+                desc_match = re.search(
+                    rf'{re.escape(desc_prefix)}\s+(.+?)(?:\d{{1,3}}\.\d{{2}}|$)',
+                    line_upper
+                )
+                if desc_match:
+                    current_description = f"{desc_prefix} {desc_match.group(1).strip()}"
+                else:
+                    current_description = desc_prefix
+
+                continue
+
+        # 가격 줄 처리 (Your Price 추출)
+        if state == ParserState.ITEM_START and current_item_code:
+            prices = re.findall(price_pattern, normalized_line)
+            if prices and len(prices) >= 1:
+                current_unit_price = float(prices[0])
+                logger.info(f"Your Price 추출: {current_unit_price} (아이템: {current_item_code})")
+                state = ParserState.COLOR_COLLECT
 
         # 색상-수량 쌍 추출
         if current_item_code:
@@ -219,9 +330,7 @@ def extract_line_items(text: str) -> List[SngLineItem]:
             for match in color_qty_matches:
                 color = match[0].strip()
                 quantity = int(match[1])
-                # backorder = int(match[2]) if match[2] else 0  # 백오더 수량
 
-                # 유효한 색상인지 확인 (숫자만 있는 것도 색상으로 인정)
                 if is_valid_color(color):
                     line_items.append(SngLineItem(
                         item_code=current_item_code,
@@ -230,38 +339,31 @@ def extract_line_items(text: str) -> List[SngLineItem]:
                         unit_price=current_unit_price,
                         description=current_description
                     ))
+                    current_has_colors = True
+                    logger.debug(f"색상-수량 추출: {current_item_code} - {color} x {quantity}")
+
+            if color_qty_matches:
+                state = ParserState.COLOR_COLLECT
+
+    # 마지막 아이템 처리
+    save_item_if_no_colors()
 
     logger.info(f"추출된 라인 아이템 수: {len(line_items)}")
     return line_items
-
-
-def is_header_text(text: str) -> bool:
-    """
-    헤더/라벨 텍스트인지 확인
-    """
-    header_words = [
-        'INVOICE', 'DATE', 'PACKED', 'ORDERED', 'SHIPPED', 'ITEM', 'NUMBER',
-        'DESCRIPTION', 'PRICE', 'EXTENDED', 'AMOUNT', 'TOTAL', 'WEIGHT',
-        'CUSTOMER', 'BILL', 'SHIP', 'VIA', 'GROUND', 'UPS', 'FEDEX',
-        'TERMS', 'REFERENCE', 'ORDER', 'SALESPERSON', 'COPY', 'STANDARD',
-        'LIST', 'YOUR', 'DISCOUNTED', 'COD', 'BOX'
-    ]
-    return text.upper() in header_words
 
 
 def is_valid_color(color: str) -> bool:
     """
     유효한 색상 코드인지 확인
     """
-    # 너무 짧거나 긴 것 제외
     if len(color) < 1 or len(color) > 20:
         return False
 
-    # 순수 숫자도 색상으로 인정 (1, 2, 27, 530, 613 등)
+    # 순수 숫자 (1, 2, 27, 530, 613 등)
     if color.isdigit():
         return True
 
-    # 알파벳+숫자 조합 (1B, P1B/30, ASH-LATTE 등)
+    # 알파벳+숫자 조합 (1B, P1B/30, ASH-LATTE, COPPER 등)
     if re.match(r'^[A-Z0-9][A-Z0-9/\-]*$', color, re.IGNORECASE):
         return True
 
@@ -287,5 +389,8 @@ def to_dict(result: SngInvoiceResult) -> dict:
             }
             for item in result.line_items
         ],
-        "raw_text_preview": result.raw_text
+        "raw_text_preview": result.raw_text,
+        # 멀티 페이지 지원: 다음 페이지 처리 시 사용
+        "last_item_code": result.last_item_code,
+        "last_unit_price": result.last_unit_price
     }

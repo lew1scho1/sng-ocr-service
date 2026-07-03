@@ -1,0 +1,81 @@
+{
+  "description": "SNG Invoice Sample 001 - 기대 파싱 결과",
+  "note": "OCR 원문에서 색상 줄 대부분이 누락됨. OCR 전처리 개선 후 재테스트 필요.",
+
+  "header": {
+    "invoice_number": "3000674313",
+    "invoice_date": "07/02/2026"
+  },
+
+  "expected_item_codes": [
+    "SFTWB14",
+    "SODWX24",
+    "SOHWXL3",
+    "SOHWXL3",
+    "SOHWXM3"
+  ],
+
+  "line_items": [
+    {
+      "item_code": "SFTWB14",
+      "unit_price": 32.00,
+      "colors": [],
+      "note": "COPPER - 2(1) 색상 줄이 OCR에서 누락됨"
+    },
+    {
+      "item_code": "SODWX24",
+      "unit_price": 7.00,
+      "colors": [],
+      "note": "ASH-LATTE - 12 색상 줄이 OCR에서 누락됨"
+    },
+    {
+      "item_code": "SOHWXL3",
+      "unit_price": 17.00,
+      "colors": [
+        {"color": "1", "qty": 4},
+        {"color": "1", "qty": 4, "note": "원본은 1B-4, OCR이 1-4로 오인식"},
+        {"color": "2", "qty": 3},
+        {"color": "4", "qty": 2},
+        {"color": "27", "qty": 2},
+        {"color": "30", "qty": 2},
+        {"color": "530", "qty": 2},
+        {"color": "613", "qty": 2}
+      ],
+      "note": "COPPER - 2 색상 줄이 OCR에서 누락됨"
+    },
+    {
+      "item_code": "SOHWXL3",
+      "unit_price": 18.00,
+      "colors": [],
+      "note": "P1B/30-2, P27/30-2, P27A/613A-2 색상 줄이 OCR에서 누락됨"
+    },
+    {
+      "item_code": "SOHWXM3",
+      "unit_price": 16.00,
+      "colors": [],
+      "note": "COPPER - 3 색상 줄이 OCR에서 누락됨"
+    }
+  ],
+
+  "fixes_applied": {
+    "normalize_line": [
+      "0G -> OG (숫자0을 문자O로)",
+      "(0G -> OG (괄호 제거 + 숫자0 보정)",
+      "« 제거 (특수문자)",
+      "SFTWBIY -> SFTWB14 (끝자리 Y->4 보정)",
+      "74,08 -> 74.08 (쉼표를 점으로)",
+      "17.08 -> 17.00 (가격 OCR 오류 보정)"
+    ],
+    "item_pattern": "숫자 앞 노이즈(Cal, rn, a, fn, Fn) 허용",
+    "color_qty_pattern": "1-4 같은 공백 없는 형태 허용",
+    "price_extraction": "아이템 줄 다음 첫 가격을 Your Price로",
+    "date_extraction": "INVOICE DATE 근처 날짜 우선"
+  },
+
+  "ocr_preprocessing_changes": {
+    "scale_order": "확대를 threshold 전에 수행",
+    "scale_target": "2000px (기존 1500px)",
+    "threshold": "150 (기존 180)",
+    "contrast": "1.8 (기존 1.5)"
+  }
+}

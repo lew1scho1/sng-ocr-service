@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 import uuid
 import asyncio
 import logging
@@ -114,7 +114,7 @@ async def create_ocr_job_sync(file: UploadFile = File(...)):
 @app.post("/api/v1/ocr/jobs/sync/sng")
 async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
     """
-    SNG (Shake-N-Go) 인보이스 전용 OCR
+    SNG (Shake-N-Go) 인보이스 전용 OCR (단일 이미지)
 
     추출 정보:
     - 헤더: Invoice NO, Invoice Date
@@ -157,10 +157,86 @@ async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
             ],
             "line_item_count": len(result.line_items),
             "raw_text_preview": raw_text[:500] if raw_text else "",
-            "raw_text_full": raw_text  # 디버그용 전체 텍스트
+            "last_item_code": result.last_item_code,
+            "last_unit_price": result.last_unit_price
         }
     except Exception as e:
         logger.error(f"SNG OCR Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/ocr/jobs/sync/sng/multi")
+async def create_ocr_job_sync_sng_multi(files: List[UploadFile] = File(...)):
+    """
+    SNG (Shake-N-Go) 인보이스 전용 OCR (멀티 페이지)
+
+    여러 이미지를 순차 처리하여 페이지 간 아이템 연결 지원
+    - 페이지 2에서 아이템 코드 없이 색상만 있으면 페이지 1의 마지막 아이템에 연결
+
+    추출 정보:
+    - 헤더: Invoice NO, Invoice Date (첫 페이지에서 추출)
+    - 라인 아이템: ITEM_CODE + COLOR + QUANTITY + UNIT_PRICE (모든 페이지 병합)
+    """
+    try:
+        all_line_items = []
+        header = None
+        prev_item_code = None
+        prev_unit_price = None
+        page_results = []
+
+        for i, file in enumerate(files):
+            image_data = await file.read()
+
+            # OCR 처리
+            raw_text = process_image(image_data)
+
+            logger.info(f"SNG OCR - Page {i + 1}/{len(files)}, {len(raw_text)} chars")
+
+            # SNG 파서로 구조화된 데이터 추출 (이전 페이지 정보 전달)
+            result = parse_sng_invoice(raw_text, prev_item_code, prev_unit_price)
+
+            # 첫 페이지에서 헤더 추출
+            if header is None and result.header.invoice_number:
+                header = result.header
+
+            # 라인 아이템 병합
+            all_line_items.extend(result.line_items)
+
+            # 다음 페이지를 위해 마지막 아이템 정보 저장
+            prev_item_code = result.last_item_code
+            prev_unit_price = result.last_unit_price
+
+            # 페이지별 결과 저장
+            page_results.append({
+                "page": i + 1,
+                "filename": file.filename,
+                "item_count": len(result.line_items),
+                "last_item_code": result.last_item_code
+            })
+
+        return {
+            "success": True,
+            "company": "SNG",
+            "page_count": len(files),
+            "header": {
+                "invoice_number": header.invoice_number if header else None,
+                "invoice_date": header.invoice_date if header else None
+            },
+            "line_items": [
+                {
+                    "item_code": item.item_code,
+                    "color": item.color,
+                    "quantity": item.quantity,
+                    "unit_price": item.unit_price,
+                    "description": item.description
+                }
+                for item in all_line_items
+            ],
+            "line_item_count": len(all_line_items),
+            "page_results": page_results
+        }
+    except Exception as e:
+        logger.error(f"SNG Multi-page OCR Error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
