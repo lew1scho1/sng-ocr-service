@@ -3,7 +3,6 @@ from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 import io
 import re
 import logging
-import pandas as pd
 from typing import List, Tuple, Optional, Dict
 
 # 데이터 모델 및 순수 함수는 ocr_models에서 import (pytesseract 비의존)
