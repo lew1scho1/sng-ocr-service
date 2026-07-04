@@ -25,6 +25,8 @@ from app.ocr_models import (
     DEFAULT_OCR_CONFIG,
     COLOR_REGION_OCR_CONFIG,
     merge_by_replacement,
+    normalize_color_region_text,
+    split_color_tokens,
     detect_color_regions_bbox,
 )
 
@@ -54,6 +56,124 @@ class TestOcrConfig:
         assert config.psm == 6
         assert "0123456789" in config.char_whitelist  # 숫자 포함
         assert "ABCDEFGHIJKLMNOPQRSTUVWXYZ" in config.char_whitelist  # 대문자 포함
+
+
+class TestNormalizeColorRegionText:
+    """normalize_color_region_text 정규화 테스트"""
+
+    def test_empty_string_returns_empty_list(self):
+        """빈 문자열은 빈 리스트 반환"""
+        result = normalize_color_region_text("")
+        assert result == []
+
+    def test_single_line_preserved(self):
+        """단일 라인 보존"""
+        result = normalize_color_region_text("1B - 3")
+        assert result == ["1B - 3"]
+
+    def test_multiple_lines_split(self):
+        """여러 줄 분리"""
+        result = normalize_color_region_text("1B - 3\n2 - 5\n30 - 6")
+        assert result == ["1B - 3", "2 - 5", "30 - 6"]
+
+    def test_empty_lines_removed(self):
+        """빈 줄 제거"""
+        result = normalize_color_region_text("1B - 3\n\n2 - 5\n\n\n30 - 6")
+        assert result == ["1B - 3", "2 - 5", "30 - 6"]
+
+    def test_whitespace_only_lines_removed(self):
+        """공백만 있는 줄 제거"""
+        result = normalize_color_region_text("1B - 3\n   \n2 - 5\n\t\t\n30 - 6")
+        assert result == ["1B - 3", "2 - 5", "30 - 6"]
+
+    def test_leading_trailing_whitespace_stripped(self):
+        """앞뒤 공백 제거"""
+        result = normalize_color_region_text("  1B - 3  \n  2 - 5  ")
+        assert result == ["1B - 3", "2 - 5"]
+
+    def test_consecutive_spaces_normalized(self):
+        """연속 공백 정규화"""
+        result = normalize_color_region_text("1B  -   3\n2   -    5")
+        assert result == ["1B - 3", "2 - 5"]
+
+    def test_tab_normalized_to_space(self):
+        """탭이 공백으로 정규화"""
+        result = normalize_color_region_text("1B\t-\t3")
+        assert result == ["1B - 3"]
+
+    def test_multiple_tokens_split_to_lines(self):
+        """한 줄에 여러 토큰이 있으면 분리"""
+        result = normalize_color_region_text("1B - 3 2 - 5 30 - 6")
+        assert result == ["1B - 3", "2 - 5", "30 - 6"]
+
+    def test_slash_color_tokens_split(self):
+        """슬래시 색상 토큰도 분리"""
+        result = normalize_color_region_text("P4/30 - 2 1B - 3")
+        assert result == ["P4/30 - 2", "1B - 3"]
+
+    def test_single_token_not_split(self):
+        """단일 토큰은 분리하지 않음"""
+        result = normalize_color_region_text("1B - 3")
+        assert result == ["1B - 3"]
+
+    def test_no_pattern_preserved(self):
+        """패턴이 없는 줄은 그대로 유지"""
+        result = normalize_color_region_text("SOME TEXT WITHOUT PATTERN")
+        assert result == ["SOME TEXT WITHOUT PATTERN"]
+
+    def test_mixed_lines_and_tokens(self):
+        """줄 분리 + 토큰 분리 조합"""
+        result = normalize_color_region_text("1B - 3 2 - 5\n30 - 6 613 - 2")
+        assert result == ["1B - 3", "2 - 5", "30 - 6", "613 - 2"]
+
+
+class TestSplitColorTokens:
+    """split_color_tokens 함수 테스트"""
+
+    def test_empty_string_returns_empty(self):
+        """빈 문자열은 빈 리스트"""
+        result = split_color_tokens("")
+        assert result == []
+
+    def test_single_token_returns_original(self):
+        """단일 토큰은 원본 그대로"""
+        result = split_color_tokens("1B - 3")
+        assert result == ["1B - 3"]
+
+    def test_multiple_simple_tokens(self):
+        """여러 간단한 토큰 분리"""
+        result = split_color_tokens("1B - 3 2 - 5 30 - 6")
+        assert result == ["1B - 3", "2 - 5", "30 - 6"]
+
+    def test_slash_color_pattern(self):
+        """슬래시 포함 색상 패턴"""
+        result = split_color_tokens("P4/30 - 2 P27/30 - 6")
+        assert result == ["P4/30 - 2", "P27/30 - 6"]
+
+    def test_compound_color_pattern(self):
+        """복합 색상 패턴 (C-42730)"""
+        result = split_color_tokens("C-42730 - 4 OT-27 - 3")
+        assert result == ["C-42730 - 4", "OT-27 - 3"]
+
+    def test_mixed_patterns(self):
+        """혼합 패턴"""
+        result = split_color_tokens("1B - 3 P4/30 - 2 613 - 1")
+        assert result == ["1B - 3", "P4/30 - 2", "613 - 1"]
+
+    def test_no_pattern_returns_original(self):
+        """패턴 없으면 원본 그대로"""
+        result = split_color_tokens("WATER CURL 14 INCH")
+        assert result == ["WATER CURL 14 INCH"]
+
+    def test_normalized_output_format(self):
+        """출력은 정규화된 형식 (COLOR - QTY)"""
+        result = split_color_tokens("1B-3 2-5")  # 공백 없는 입력
+        assert result == ["1B - 3", "2 - 5"]  # 공백 있는 출력
+
+    def test_uppercase_conversion(self):
+        """소문자도 대문자로 변환"""
+        result = split_color_tokens("1b - 3 p4/30 - 2")
+        assert result == ["1B - 3", "P4/30 - 2"]
 
 
 class TestMergeByReplacement:
@@ -168,6 +288,93 @@ class TestMergeByReplacement:
         line3_idx = next(i for i, l in enumerate(lines) if "Line 3" in l)
 
         assert line1_idx < replaced_idx < line3_idx
+
+    def test_multiline_region_text_expands_to_multiple_lines(self):
+        """여러 줄 region_text가 개별 라인으로 확장됨"""
+        ocr_lines = [
+            OcrLine(text="Header", y_top=0, y_bottom=20, confidence=90.0),
+            OcrLine(text="IB - 3 2 - S", y_top=100, y_bottom=120, confidence=50.0),
+            OcrLine(text="Footer", y_top=200, y_bottom=220, confidence=90.0),
+        ]
+
+        # 재OCR 결과가 여러 줄인 경우
+        color_results = [
+            ColorRegionResult(
+                region_text="1B - 3\n2 - 5\n30 - 6",  # 3줄
+                y_start=100,
+                y_end=120,
+                confidence=0.8,
+                original_lines=[1]
+            )
+        ]
+
+        result = merge_by_replacement(ocr_lines, color_results)
+        lines = result.split('\n')
+
+        # 원본 1줄이 3줄로 확장됨
+        assert "Header" in lines[0]
+        assert "1B - 3" in result
+        assert "2 - 5" in result
+        assert "30 - 6" in result
+        assert "Footer" in result
+        assert "IB - 3 2 - S" not in result  # 원본 제거
+
+    def test_parser_friendly_line_structure(self):
+        """파서 친화적 줄 구조 유지 - 각 색상은 독립 줄"""
+        ocr_lines = [
+            OcrLine(text="STEST01 OG ITEM", y_top=0, y_bottom=20, confidence=90.0),
+            OcrLine(text="7.00", y_top=25, y_bottom=45, confidence=90.0),
+            OcrLine(text="IB - 3 2 - S 30 - G", y_top=50, y_bottom=70, confidence=50.0),
+            OcrLine(text="STEST02 OG ITEM", y_top=100, y_bottom=120, confidence=90.0),
+        ]
+
+        # 색상이 각각 독립 줄로 재OCR됨
+        color_results = [
+            ColorRegionResult(
+                region_text="1B - 3\n2 - 5\n30 - 6",
+                y_start=50,
+                y_end=70,
+                confidence=0.8,
+                original_lines=[2]
+            )
+        ]
+
+        result = merge_by_replacement(ocr_lines, color_results)
+        lines = result.split('\n')
+
+        # 아이템 → 가격 → 색상들 → 다음 아이템 순서
+        assert lines[0] == "STEST01 OG ITEM"
+        assert lines[1] == "7.00"
+        assert lines[2] == "1B - 3"
+        assert lines[3] == "2 - 5"
+        assert lines[4] == "30 - 6"
+        assert lines[5] == "STEST02 OG ITEM"
+
+    def test_whitespace_normalized_in_replacement(self):
+        """교체 텍스트의 공백이 정규화됨"""
+        ocr_lines = [
+            OcrLine(text="Header", y_top=0, y_bottom=20, confidence=90.0),
+            OcrLine(text="Color", y_top=50, y_bottom=70, confidence=50.0),
+        ]
+
+        # OCR 결과에 불규칙한 공백이 있는 경우
+        color_results = [
+            ColorRegionResult(
+                region_text="  1B  -  3  \n\n  2   -   5  \n\t\t",
+                y_start=50,
+                y_end=70,
+                confidence=0.8,
+                original_lines=[1]
+            )
+        ]
+
+        result = merge_by_replacement(ocr_lines, color_results)
+        lines = result.split('\n')
+
+        # 공백 정규화 확인
+        assert "1B - 3" in lines
+        assert "2 - 5" in lines
+        assert "  " not in result  # 연속 공백 없음
 
 
 class TestDetectColorRegionsBbox:

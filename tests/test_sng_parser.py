@@ -25,7 +25,12 @@ from app.parsers.sng_parser import (
     extract_header,
     normalize_line,
     normalize_qty_string,
-    SngLineItem
+    SngLineItem,
+    ItemBlock,
+    RawColorCandidate,
+    CandidateStatus,
+    collect_color_candidates,
+    finalize_block_items,
 )
 
 
@@ -361,6 +366,181 @@ class TestSngLineItemDataclass:
         assert not hasattr(item, 'raw_item_code'), "레거시 raw_item_code 필드 존재"
         assert not hasattr(item, 'item_code_candidates'), "레거시 item_code_candidates 필드 존재"
         assert not hasattr(item, 'description_tokens'), "레거시 description_tokens 필드 존재"
+
+
+class TestTwoPassProcessing:
+    """
+    2-pass 처리 테스트
+
+    핵심 검증:
+    - 확정 색상은 없지만 약한 후보가 남는지
+    - block에 약한 후보만 있어도 즉시 색상 없는 아이템으로 확정되지 않는지
+    - raw candidate와 confirmed color가 함께 있을 때 둘 다 보존되는지
+    """
+
+    def test_weak_candidate_preserved(self):
+        """약한 후보가 보존되어야 함 (IB - S, 30 - G 등)"""
+        block = ItemBlock(
+            item_code_raw="STEST01",
+            content_lines=["IB - S", "30 - G", "P27/30 - Z"]
+        )
+
+        collect_color_candidates(block)
+
+        # 확정 색상은 없지만 약한 후보가 있어야 함
+        assert len(block.confirmed_colors) == 0, "확정 색상이 있으면 안 됨"
+        assert len(block.raw_color_candidates) > 0, "약한 후보가 있어야 함"
+
+    def test_weak_only_block_not_empty(self):
+        """약한 후보만 있는 블록도 색상 없는 아이템으로 확정되지 않아야 함"""
+        block = ItemBlock(
+            item_code_raw="STEST01",
+            qty_shipped=5,
+            content_lines=["IB - S", "30 - G"]
+        )
+
+        collect_color_candidates(block)
+        items = finalize_block_items(block)
+
+        # 색상 없는 아이템이 아니라 약한 후보로 처리되어야 함
+        assert len(items) > 0
+        # 약한 후보가 있으면 color_status가 "weak"여야 함
+        if block.raw_color_candidates:
+            assert any(item.color_status == "weak" for item in items), \
+                "약한 후보가 있으면 color_status='weak'여야 함"
+
+    def test_confirmed_and_weak_preserved(self):
+        """확정 색상과 약한 후보가 함께 있을 때 둘 다 보존되어야 함"""
+        block = ItemBlock(
+            item_code_raw="STEST01",
+            content_lines=["1B - 3", "IB - S", "30 - G"]  # 1B-3은 확정, IB-S/30-G는 약함
+        )
+
+        collect_color_candidates(block)
+
+        # 확정 색상이 있어야 함
+        assert len(block.confirmed_colors) >= 1, "확정 색상이 있어야 함"
+        # raw_candidates에도 데이터가 있을 수 있음
+
+    def test_no_discard_before_block_end(self):
+        """블록 종료 전에 후보가 버려지지 않아야 함"""
+        block = ItemBlock(
+            item_code_raw="STEST01",
+            content_lines=["1B - 3", "2 - 5", "IB - S"]
+        )
+
+        collect_color_candidates(block)
+
+        # 모든 색상 패턴이 어딘가에 보존되어야 함
+        all_colors = [c.color_raw for c in block.confirmed_colors + block.raw_color_candidates]
+        assert "1B" in all_colors or "IB" in all_colors, "1B/IB가 보존되어야 함"
+        assert "2" in all_colors, "2가 보존되어야 함"
+
+    def test_description_not_collected_as_color(self):
+        """설명 줄이 색상 후보로 과수집되지 않아야 함"""
+        block = ItemBlock(
+            item_code_raw="STEST01",
+            content_lines=["WATER CURL 14 INCH", "1B - 3"]
+        )
+
+        collect_color_candidates(block)
+
+        # WATER, CURL, INCH 등이 색상 후보에 없어야 함
+        all_colors = [c.color_raw for c in block.confirmed_colors + block.raw_color_candidates]
+        assert "WATER" not in all_colors
+        assert "CURL" not in all_colors
+        assert "INCH" not in all_colors
+
+    def test_price_not_collected_as_color(self):
+        """가격 줄이 색상 후보로 과수집되지 않아야 함"""
+        block = ItemBlock(
+            item_code_raw="STEST01",
+            content_lines=["7.00 10.00 84.00", "1B - 3"]
+        )
+
+        collect_color_candidates(block)
+
+        # 가격 패턴이 색상에 없어야 함
+        all_colors = [c.color_raw for c in block.confirmed_colors + block.raw_color_candidates]
+        assert "7" not in all_colors
+        assert "10" not in all_colors
+
+
+class TestLineItemColorStatus:
+    """SngLineItem color_status 필드 테스트"""
+
+    def test_confirmed_status(self):
+        """확정 색상은 color_status='confirmed'"""
+        text = """
+        12 12 STEST01 OG TEST
+        7.00
+        1B - 3
+        2 - 5
+        """
+        result = parse_sng_invoice(text)
+
+        # 정상 색상-수량이면 confirmed
+        for item in result.line_items:
+            if item.color_raw:
+                assert item.color_status in ("confirmed", "weak"), \
+                    f"color_status가 confirmed/weak가 아님: {item.color_status}"
+
+    def test_no_color_status(self):
+        """색상 없는 아이템은 color_status='no_color'"""
+        text = """
+        12 12 STEST01 OG TEST
+        7.00
+        JUST DESCRIPTION NO COLOR
+        """
+        result = parse_sng_invoice(text)
+
+        # 색상이 없는 아이템 확인
+        no_color_items = [item for item in result.line_items if not item.color_raw]
+        for item in no_color_items:
+            assert item.color_status == "no_color", \
+                f"색상 없는 아이템의 color_status가 no_color가 아님: {item.color_status}"
+
+    def test_raw_candidates_field_exists(self):
+        """raw_candidates 필드가 존재해야 함"""
+        text = """
+        12 12 STEST01 OG TEST
+        7.00
+        1B - 3
+        """
+        result = parse_sng_invoice(text)
+
+        for item in result.line_items:
+            assert hasattr(item, 'raw_candidates'), "raw_candidates 필드 없음"
+            assert isinstance(item.raw_candidates, list), "raw_candidates가 리스트가 아님"
+
+
+class TestCompoundColorPatterns:
+    """복합 색상 패턴 (C-42730, OT-27 등) 테스트"""
+
+    def test_compound_with_space(self):
+        """공백 포함 복합 색상 (C 42730 - 4)"""
+        block = ItemBlock(
+            item_code_raw="STEST01",
+            content_lines=["C 42730 - 4"]
+        )
+
+        collect_color_candidates(block)
+
+        all_colors = [c.color_raw for c in block.confirmed_colors + block.raw_color_candidates]
+        # C-42730 형태로 수집되어야 함
+        assert any("42730" in c for c in all_colors), "복합 색상이 수집되어야 함"
+
+    def test_compound_with_dash(self):
+        """대시 포함 복합 색상 (OT-27 - 3)"""
+        block = ItemBlock(
+            item_code_raw="STEST01",
+            content_lines=["OT-27 - 3"]
+        )
+
+        collect_color_candidates(block)
+
+        all_colors = [c.color_raw for c in block.confirmed_colors + block.raw_color_candidates]
+        assert any("OT-27" in c or "OT" in c for c in all_colors), "OT-27이 수집되어야 함"
 
 
 if __name__ == "__main__":

@@ -1,15 +1,21 @@
 """
-SNG (Shake-N-Go) 인보이스 파서 (Block-based Extraction 버전)
+SNG (Shake-N-Go) 인보이스 파서 (2-Pass Block Processing 버전)
 
 전략 변경 (2024-07):
-- 줄 단위 순차 FSM → 블록 단위 수집 후 후처리
-- 아이템 시작 → 다음 아이템까지 모든 줄 수집
-- 색상 줄 누락 복구 가능
+- 1-pass 확정 판정 → 2-pass 후보 수집 + 후처리
+- 확정 색상 / 약한 후보 / 기타 줄 분리
+- 색상 판정 실패 후보도 raw candidate로 보존
+
+핵심 원칙:
+- "확정 실패"와 "후보 폐기"를 분리
+- early discard 방지
+- raw candidate를 block 후단까지 보존
 
 역할: 순수 Extraction만 담당
 - 라인 분리 및 구조 파싱
 - 기본 노이즈 제거 (패턴 매칭 위한 최소한의 정규화)
 - Raw 값 반환 (item_code_raw, color_raw, description_raw)
+- raw_candidates 포함 (후단 분석용)
 
 OCR 보정 및 DB 매칭은 Rails ProductMatcher에서 처리:
 - 색상 보정 (IB→1B, O→0 등)
@@ -19,8 +25,9 @@ OCR 보정 및 DB 매칭은 Rails ProductMatcher에서 처리:
 
 import re
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Set
 from dataclasses import dataclass, field
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
@@ -35,15 +42,39 @@ QTY_OCR_MAP = {
 }
 
 
+class CandidateStatus(Enum):
+    """색상 후보 상태"""
+    CONFIRMED = "confirmed"        # DB/패턴상 확정
+    WEAK = "weak"                  # 구조는 색상 같지만 OCR 오류 가능
+    REJECTED = "rejected"          # 명확히 비색상
+
+
+@dataclass
+class RawColorCandidate:
+    """색상 후보 (raw 데이터 보존)"""
+    color_raw: str                      # OCR 원본 색상 토큰
+    qty_raw: str                        # OCR 원본 수량 토큰
+    color_normalized: Optional[str] = None   # 정규화된 색상 (가능하면)
+    qty_normalized: Optional[int] = None     # 정규화된 수량 (가능하면)
+    source_line: str = ""               # 출처 라인
+    status: CandidateStatus = CandidateStatus.WEAK
+    score: float = 0.0                  # 후보 점수
+    reason_flags: List[str] = field(default_factory=list)  # 판정 이유
+
+
 @dataclass
 class ItemBlock:
-    """아이템 블록 (수집 단계)"""
+    """아이템 블록 (2-pass 수집 단계)"""
     item_code_raw: str
     description_raw: Optional[str] = None
     unit_price: Optional[float] = None
     qty_ordered: int = 0
     qty_shipped: int = 0
-    content_lines: List[str] = field(default_factory=list)  # 색상 줄 포함 모든 후속 줄
+    content_lines: List[str] = field(default_factory=list)  # 모든 후속 줄
+    # 2-pass용 필드
+    confirmed_colors: List[RawColorCandidate] = field(default_factory=list)
+    raw_color_candidates: List[RawColorCandidate] = field(default_factory=list)
+    unclassified_lines: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -62,6 +93,9 @@ class SngLineItem:
     description_raw: Optional[str] = None  # OCR 원본 설명
     qty_ordered: Optional[int] = None
     qty_shipped: Optional[int] = None
+    # 2-pass용 디버그 필드
+    color_status: str = "confirmed"     # "confirmed" | "weak" | "no_color"
+    raw_candidates: List[dict] = field(default_factory=list)  # 디버그용 raw 후보들
 
 
 @dataclass
@@ -370,54 +404,261 @@ def detect_item_start(line_upper: str, pattern_with_qty: str, pattern_simple: st
 
 def process_item_blocks(blocks: List[ItemBlock]) -> List[SngLineItem]:
     """
-    Phase 2: 블록 처리 → 라인 아이템 생성
+    Phase 2: 2-pass 블록 처리 → 라인 아이템 생성
 
-    각 블록에서 색상-수량 패턴 추출
-    색상이 없으면 색상 없는 아이템으로 저장
+    Pass 1: 느슨한 패턴으로 모든 후보 수집 (아무것도 버리지 않음)
+    Pass 2: 후보 분류 및 최종 판정
+
+    핵심 원칙:
+    - "확정 실패"와 "후보 폐기"를 분리
+    - confirmed color가 없어도 raw candidate가 있으면 보존
+    - 둘 다 없을 때만 진짜 "색상 없는 아이템"
     """
     line_items = []
 
-    # 색상-수량 패턴 (넓은 매칭)
-    color_qty_pattern = r'([A-Z0-9][A-Z0-9/]*(?:-[A-Z0-9]+)?)\s*[-–—]\s*(\d{1,3})'
-
     for block in blocks:
-        colors_found = []
+        # Pass 1: 후보 수집 (느슨한 패턴)
+        collect_color_candidates(block)
 
-        # 블록 내 모든 줄에서 색상-수량 추출
-        for content_line in block.content_lines:
-            matches = re.findall(color_qty_pattern, content_line)
-            for match in matches:
-                color_raw = match[0].strip()
-                quantity = int(match[1])
+        # Pass 2: 후보 분류 및 라인 아이템 생성
+        items = finalize_block_items(block)
+        line_items.extend(items)
 
-                if is_valid_color(color_raw):
-                    colors_found.append((color_raw, quantity))
+    return line_items
 
-        if colors_found:
-            # 색상별 라인 아이템 생성
-            for color_raw, quantity in colors_found:
-                line_items.append(SngLineItem(
-                    item_code_raw=block.item_code_raw,
-                    color_raw=color_raw,
-                    quantity=quantity,
-                    unit_price=block.unit_price,
-                    description_raw=block.description_raw,
-                    qty_ordered=block.qty_ordered,
-                    qty_shipped=block.qty_shipped
-                ))
-                logger.debug(f"색상-수량: {block.item_code_raw} - {color_raw} x {quantity}")
-        else:
-            # 색상 없는 아이템
+
+def collect_color_candidates(block: ItemBlock) -> None:
+    """
+    Pass 1: 느슨한 패턴으로 색상 후보 수집
+
+    수집 규칙:
+    - 짧은 토큰 + 숫자 구조면 우선 보존
+    - OCR 오류가 낀 수량도 raw로 보존
+    - 정확한 color code가 아니라 color-like + qty-like 구조면 수집
+
+    느슨한 후보 패턴:
+    - XX - 3, 613 - 2 (짧은 토큰 뒤 숫자)
+    - P4/30 - 2 (slash 포함)
+    - C-42730 - 4, C 42730 - 4 (compound)
+    - 30 - G, 1B - S (OCR 오류 수량)
+    """
+    # 느슨한 색상-수량 패턴들
+    # 패턴 1: 정상 색상-수량 (확정 후보)
+    confirmed_pattern = r'([A-Z0-9][A-Z0-9/]*(?:-[A-Z0-9]+)?)\s*[-–—]\s*(\d{1,3})'
+
+    # 패턴 2: 수량이 OCR 오류인 경우 (약한 후보)
+    # 예: 30 - G, 1B - S, P4/30 - Z
+    weak_qty_pattern = r'([A-Z0-9][A-Z0-9/]*(?:-[A-Z0-9]+)?)\s*[-–—]\s*([A-Z0-9]{1,3})'
+
+    # 패턴 3: 복합 색상 (공백 포함) - C 42730 - 4
+    compound_pattern = r'([A-Z])\s+(\d{4,6})\s*[-–—]\s*(\d{1,3})'
+
+    # 제외 패턴 (명확한 비색상)
+    exclude_patterns = [
+        r'\b(WATER|BODY|WAVE|CURL|TWIST|BRAID|DEEP|LOOSE|NATURAL|ORGANIQUE)\b',
+        r'\b\d{1,3}\.\d{2}\b',  # 가격
+        r'\bS[A-Z]{4,}\d*\b',   # 아이템 코드
+    ]
+
+    for content_line in block.content_lines:
+        line_upper = content_line.upper().strip()
+
+        # 명확한 비색상 줄 분류
+        is_non_color = False
+        for pattern in exclude_patterns:
+            if re.search(pattern, line_upper):
+                # 제외 패턴이 있어도 색상 패턴도 있으면 후보로 유지
+                if not re.search(confirmed_pattern, line_upper):
+                    is_non_color = True
+                    break
+
+        if is_non_color and not re.search(weak_qty_pattern, line_upper):
+            block.unclassified_lines.append(line_upper)
+            continue
+
+        # 패턴 1: 확정 후보 수집
+        matches = re.findall(confirmed_pattern, line_upper)
+        for match in matches:
+            color_raw = match[0].strip()
+            qty_raw = match[1].strip()
+
+            if len(color_raw) < 1 or len(color_raw) > 15:
+                continue
+
+            # 수량 정규화 시도
+            qty_normalized = normalize_qty_string(qty_raw)
+
+            candidate = RawColorCandidate(
+                color_raw=color_raw,
+                qty_raw=qty_raw,
+                color_normalized=color_raw,  # 색상은 그대로
+                qty_normalized=qty_normalized,
+                source_line=line_upper,
+                status=CandidateStatus.CONFIRMED if qty_normalized else CandidateStatus.WEAK,
+                score=1.0 if qty_normalized else 0.7,
+                reason_flags=["pattern:confirmed"] if qty_normalized else ["pattern:qty_parse_weak"]
+            )
+
+            if candidate.status == CandidateStatus.CONFIRMED:
+                block.confirmed_colors.append(candidate)
+            else:
+                block.raw_color_candidates.append(candidate)
+
+        # 패턴 2: 약한 후보 수집 (수량이 문자인 경우)
+        weak_matches = re.findall(weak_qty_pattern, line_upper)
+        for match in weak_matches:
+            color_raw = match[0].strip()
+            qty_raw = match[1].strip()
+
+            # 이미 확정 후보에 있으면 건너뜀
+            if any(c.color_raw == color_raw and c.qty_raw == qty_raw
+                   for c in block.confirmed_colors + block.raw_color_candidates):
+                continue
+
+            if len(color_raw) < 1 or len(color_raw) > 15:
+                continue
+
+            # 순수 숫자가 아닌 경우만 (이미 위에서 처리됨)
+            if qty_raw.isdigit():
+                continue
+
+            # OCR 오류 수량 정규화 시도
+            qty_normalized = normalize_qty_string(qty_raw)
+
+            candidate = RawColorCandidate(
+                color_raw=color_raw,
+                qty_raw=qty_raw,
+                color_normalized=color_raw,
+                qty_normalized=qty_normalized,
+                source_line=line_upper,
+                status=CandidateStatus.WEAK,
+                score=0.5,
+                reason_flags=["pattern:weak_qty", f"qty_raw:{qty_raw}"]
+            )
+            block.raw_color_candidates.append(candidate)
+
+        # 패턴 3: 복합 색상 수집
+        compound_matches = re.findall(compound_pattern, line_upper)
+        for match in compound_matches:
+            prefix = match[0].strip()
+            number = match[1].strip()
+            qty_raw = match[2].strip()
+
+            color_raw = f"{prefix}-{number}"
+
+            # 이미 있으면 건너뜀
+            if any(c.color_raw == color_raw for c in block.confirmed_colors + block.raw_color_candidates):
+                continue
+
+            qty_normalized = normalize_qty_string(qty_raw)
+
+            candidate = RawColorCandidate(
+                color_raw=color_raw,
+                qty_raw=qty_raw,
+                color_normalized=color_raw,
+                qty_normalized=qty_normalized,
+                source_line=line_upper,
+                status=CandidateStatus.CONFIRMED if qty_normalized else CandidateStatus.WEAK,
+                score=0.9 if qty_normalized else 0.6,
+                reason_flags=["pattern:compound"]
+            )
+
+            if candidate.status == CandidateStatus.CONFIRMED:
+                block.confirmed_colors.append(candidate)
+            else:
+                block.raw_color_candidates.append(candidate)
+
+    # 로깅
+    logger.debug(
+        f"[Pass1] {block.item_code_raw}: "
+        f"confirmed={len(block.confirmed_colors)}, "
+        f"weak={len(block.raw_color_candidates)}, "
+        f"unclassified={len(block.unclassified_lines)}"
+    )
+
+
+def finalize_block_items(block: ItemBlock) -> List[SngLineItem]:
+    """
+    Pass 2: 후보 분류 및 최종 라인 아이템 생성
+
+    판정 규칙:
+    1. confirmed color가 있으면 → 일반 처리
+    2. confirmed는 없지만 raw candidate가 있으면 → "색상 미확정 후보 포함" 아이템
+    3. 둘 다 없을 때만 → 진짜 "색상 없는 아이템"
+    """
+    line_items = []
+
+    # 디버그용 raw candidates 직렬화
+    all_candidates_dict = [
+        {
+            "color_raw": c.color_raw,
+            "qty_raw": c.qty_raw,
+            "color_norm": c.color_normalized,
+            "qty_norm": c.qty_normalized,
+            "status": c.status.value,
+            "score": c.score,
+            "reasons": c.reason_flags
+        }
+        for c in block.confirmed_colors + block.raw_color_candidates
+    ]
+
+    # Case 1: 확정 색상이 있음
+    if block.confirmed_colors:
+        for candidate in block.confirmed_colors:
+            qty = candidate.qty_normalized if candidate.qty_normalized else 0
             line_items.append(SngLineItem(
                 item_code_raw=block.item_code_raw,
-                color_raw="",
-                quantity=block.qty_shipped,
+                color_raw=candidate.color_raw,
+                quantity=qty,
                 unit_price=block.unit_price,
                 description_raw=block.description_raw,
                 qty_ordered=block.qty_ordered,
-                qty_shipped=block.qty_shipped
+                qty_shipped=block.qty_shipped,
+                color_status="confirmed",
+                raw_candidates=all_candidates_dict
             ))
-            logger.info(f"색상 없는 아이템: {block.item_code_raw}")
+            logger.debug(f"[확정] {block.item_code_raw} - {candidate.color_raw} x {qty}")
+
+    # Case 2: 확정은 없지만 약한 후보가 있음
+    elif block.raw_color_candidates:
+        # 점수 높은 순으로 정렬
+        sorted_candidates = sorted(block.raw_color_candidates, key=lambda c: c.score, reverse=True)
+
+        for candidate in sorted_candidates:
+            qty = candidate.qty_normalized if candidate.qty_normalized else 0
+            line_items.append(SngLineItem(
+                item_code_raw=block.item_code_raw,
+                color_raw=candidate.color_raw,
+                quantity=qty,
+                unit_price=block.unit_price,
+                description_raw=block.description_raw,
+                qty_ordered=block.qty_ordered,
+                qty_shipped=block.qty_shipped,
+                color_status="weak",
+                raw_candidates=all_candidates_dict
+            ))
+            logger.info(
+                f"[약한후보] {block.item_code_raw} - {candidate.color_raw} x {qty} "
+                f"(score={candidate.score:.2f}, reasons={candidate.reason_flags})"
+            )
+
+    # Case 3: 둘 다 없음 → 진짜 색상 없는 아이템
+    else:
+        line_items.append(SngLineItem(
+            item_code_raw=block.item_code_raw,
+            color_raw="",
+            quantity=block.qty_shipped,
+            unit_price=block.unit_price,
+            description_raw=block.description_raw,
+            qty_ordered=block.qty_ordered,
+            qty_shipped=block.qty_shipped,
+            color_status="no_color",
+            raw_candidates=all_candidates_dict
+        ))
+        logger.info(
+            f"[색상없음] {block.item_code_raw}: "
+            f"confirmed=0, weak=0, unclassified={len(block.unclassified_lines)}"
+        )
 
     return line_items
 
@@ -451,7 +692,10 @@ def to_dict(result: SngInvoiceResult) -> dict:
                 "unit_price": item.unit_price,
                 "description_raw": item.description_raw,
                 "qty_ordered": item.qty_ordered,
-                "qty_shipped": item.qty_shipped
+                "qty_shipped": item.qty_shipped,
+                # 2-pass 디버그 정보
+                "color_status": item.color_status,
+                "raw_candidates": item.raw_candidates
             }
             for item in result.line_items
         ],

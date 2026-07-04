@@ -566,47 +566,179 @@ def generate_color_variants(color: str) -> List[str]:
 
 
 # =============================================================================
-# 텍스트 병합
+# 텍스트 병합 (Line-list 기반 v2)
 # =============================================================================
+
+def normalize_color_region_text(region_text: str) -> List[str]:
+    """
+    재OCR된 region_text를 파서 친화적 라인 리스트로 정규화
+
+    문제점:
+    - region_text가 여러 줄이 하나로 붙어있을 수 있음
+    - 빈 줄, 공백만 있는 줄 처리 필요
+    - 한 줄에 여러 색상-수량 토큰이 붙어있을 수 있음
+
+    정규화 규칙:
+    1. 줄바꿈 기준 분리
+    2. 각 줄 strip (앞뒤 공백 제거)
+    3. 빈 줄 제거
+    4. 연속 공백 정규화 (2개 이상 → 1개)
+    5. **Token-level splitting**: 한 줄에 색상-수량 패턴 2개 이상 시 분리
+
+    Returns:
+        정규화된 라인 리스트
+    """
+    if not region_text:
+        return []
+
+    lines = region_text.split('\n')
+    normalized = []
+
+    for line in lines:
+        # strip 및 연속 공백 정규화
+        cleaned = ' '.join(line.split())
+        if cleaned:
+            # Token-level splitting 시도
+            split_lines = split_color_tokens(cleaned)
+            normalized.extend(split_lines)
+
+    logger.debug(f"[정규화] 원본 {len(lines)}줄 → 정규화 {len(normalized)}줄")
+    for i, line in enumerate(normalized):
+        logger.debug(f"  [{i}] '{line[:60]}{'...' if len(line) > 60 else ''}'")
+
+    return normalized
+
+
+def split_color_tokens(line: str) -> List[str]:
+    """
+    한 줄에 여러 색상-수량 토큰이 있으면 분리
+
+    예시:
+    - "1B - 3 2 - 5 30 - 6" → ["1B - 3", "2 - 5", "30 - 6"]
+    - "P4/30 - 2 1B - 3" → ["P4/30 - 2", "1B - 3"]
+    - "1B - 3" → ["1B - 3"] (단일 토큰은 그대로)
+    - "SOME TEXT" → ["SOME TEXT"] (패턴 없으면 그대로)
+
+    Returns:
+        분리된 라인 리스트
+    """
+    if not line:
+        return []
+
+    # 색상-수량 토큰 패턴 (넓은 매칭)
+    # 색상: 알파벳/숫자/슬래시 조합 (1-10자)
+    # 구분자: - – — (공백 포함 가능)
+    # 수량: 1-3자리 숫자
+    token_pattern = r'([A-Z0-9][A-Z0-9/]*(?:-[A-Z0-9]+)?)\s*[-–—]\s*(\d{1,3})'
+
+    line_upper = line.upper()
+    matches = list(re.finditer(token_pattern, line_upper))
+
+    # 토큰이 2개 미만이면 분리하지 않음
+    if len(matches) < 2:
+        return [line]
+
+    # 각 토큰을 독립 라인으로
+    result = []
+    for match in matches:
+        color = match.group(1)
+        qty = match.group(2)
+        # 원본 대소문자 유지를 위해 원본에서 추출
+        start, end = match.span()
+        original_token = line[start:end] if start < len(line) else f"{color} - {qty}"
+        # 정규화된 형태로 저장 (일관성)
+        result.append(f"{color} - {qty}")
+
+    logger.debug(f"[Token Split] '{line[:40]}...' → {len(result)}개 토큰")
+    return result
+
 
 def merge_by_replacement(ocr_lines: List[OcrLine], color_results: List[ColorRegionResult]) -> str:
     """
-    Block Merge: 원본 라인을 재OCR 결과로 교체
+    Line-list 기반 Block Merge (v2)
 
-    기존 append 방식의 문제점:
-    - 파서가 중복 컨텍스트를 처리해야 함
-    - COLOR_REGION_OCR 마커 파싱 필요
+    개선점:
+    - 문자열 교체 → 라인 리스트 치환
+    - region_text 정규화 적용
+    - 라인별 디버그 로깅
 
-    개선:
-    - 재OCR 대상 라인을 찾아서 직접 교체
-    - 파서는 깨끗한 단일 텍스트만 처리
+    파서-병합 계약:
+    - 아이템 헤더: 1줄
+    - 가격 라인: 1줄
+    - 색상 라인: 독립적인 줄로 유지
     """
-    if not color_results:
-        return "\n".join([line.text for line in ocr_lines])
+    logger.info(f"[Merge] 시작: {len(ocr_lines)}개 원본 라인, {len(color_results)}개 색상 영역")
 
-    # 교체 대상 라인 인덱스 수집
-    replaced_indices = set()
-    replacements = {}  # {첫번째_라인_인덱스: 대체_텍스트}
+    if not color_results:
+        result = "\n".join([line.text for line in ocr_lines])
+        logger.debug("[Merge] 색상 영역 없음 - 원본 그대로 반환")
+        return result
+
+    # 교체 맵 생성 (라인 인덱스 → 대체 라인 리스트)
+    replaced_indices: Set[int] = set()
+    replacements: Dict[int, List[str]] = {}  # {첫번째_라인_인덱스: [대체_라인들]}
 
     for result in color_results:
         if result.original_lines:
-            # 해당 그룹의 첫 번째 라인 위치에 재OCR 결과 삽입
             first_idx = min(result.original_lines)
-            replacements[first_idx] = result.region_text.strip()
-            # 나머지 라인은 제거 대상
+
+            # region_text 정규화 (줄 구조 보존)
+            normalized_lines = normalize_color_region_text(result.region_text)
+
+            replacements[first_idx] = normalized_lines
+
+            # 원본 라인들은 모두 제거 대상
             for idx in result.original_lines:
                 replaced_indices.add(idx)
 
-    # 병합된 텍스트 생성
-    merged_lines = []
+            logger.debug(
+                f"[Merge] 영역 y={result.y_start}-{result.y_end}: "
+                f"원본 라인 {result.original_lines} → {len(normalized_lines)}줄로 교체"
+            )
+
+    # 병합 수행 (라인 리스트 기반)
+    merged_lines: List[str] = []
+    original_used = 0
+    replaced_count = 0
+
     for i, line in enumerate(ocr_lines):
         if i in replacements:
-            # 재OCR 결과로 교체
-            merged_lines.append(replacements[i])
+            # 정규화된 라인 리스트로 교체
+            replacement_lines = replacements[i]
+            merged_lines.extend(replacement_lines)
+            replaced_count += len(replacement_lines)
+
+            # 디버그: 교체 상세
+            logger.debug(f"[Merge] line[{i}] 교체:")
+            logger.debug(f"  원본: '{line.text[:50]}{'...' if len(line.text) > 50 else ''}'")
+            for j, rep_line in enumerate(replacement_lines):
+                logger.debug(f"  대체[{j}]: '{rep_line[:50]}{'...' if len(rep_line) > 50 else ''}'")
+
         elif i not in replaced_indices:
-            # 교체 대상이 아닌 일반 라인
+            # 교체 대상이 아닌 일반 라인 유지
             merged_lines.append(line.text)
-        # replaced_indices에만 있는 경우 (나머지 라인): 건너뜀
+            original_used += 1
+
+        # replaced_indices에만 있는 경우 (중간/끝 라인): 건너뜀
+
+    # 최종 병합 결과 로깅
+    logger.info(
+        f"[Merge] 완료: 원본 {original_used}줄 유지 + 대체 {replaced_count}줄 "
+        f"= 총 {len(merged_lines)}줄"
+    )
+
+    # 최종 줄 구조 디버그 (파서 디버깅용)
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("[Merge] 최종 줄 구조:")
+        for i, line in enumerate(merged_lines[:30]):  # 처음 30줄만
+            marker = ""
+            # 아이템 라인 여부 표시
+            if re.search(r'\bS[A-Z]{2,}\d{2,}\b', line.upper()):
+                marker = " [ITEM]"
+            # 색상-수량 패턴 여부 표시
+            elif re.search(r'\b[A-Z0-9/]+\s*[-–—]\s*\d{1,3}\b', line.upper()):
+                marker = " [COLOR]"
+            logger.debug(f"  [{i:2d}]{marker} '{line[:60]}{'...' if len(line) > 60 else ''}'")
 
     return "\n".join(merged_lines)
 
