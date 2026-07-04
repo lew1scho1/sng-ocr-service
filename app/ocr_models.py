@@ -69,11 +69,16 @@ def detect_color_regions_bbox(
     valid_colors: Optional[Set[str]] = None
 ) -> List[Tuple[int, int, List[int]]]:
     """
-    bbox 좌표 기반으로 색상-수량 영역 감지 (구조 우선)
+    bbox 좌표 기반으로 색상-수량 영역 감지 (구조 우선, 넓은 recall)
 
     전략 변경:
     - 감지 단계: 구조 패턴만으로 넓게 감지 (DB 검증 제거)
     - 파싱 단계: DB 검증으로 후보 점수화 (Rails ProductMatcher)
+
+    개선 (2024-07):
+    - 가격 패턴 제외 삭제 (색상 라인과 공존 가능)
+    - 다중 패턴으로 recall 향상
+    - 헤더 라인만 제외 (명확한 메타데이터)
 
     Args:
         ocr_lines: OCR 라인 목록
@@ -86,20 +91,24 @@ def detect_color_regions_bbox(
     if not ocr_lines:
         return []
 
-    # 색상-수량 패턴: "색상코드 - 수량" 형태 (넓은 매칭)
-    # 색상코드: 알파벳/숫자 조합 (1-10자)
-    # 수량: 1-3자리 숫자
-    color_qty_pattern = r'\b([A-Z0-9][A-Z0-9/\-]*)\s*[-–—]\s*(\d{1,3})\b'
+    # 색상-수량 패턴들 (넓은 매칭, 다중 패턴)
+    # 패턴 1: "색상코드 - 수량" (dash 포함, 기본)
+    # 패턴 2: "색상코드 ~ 수량" (OCR이 dash를 ~로 인식)
+    # 패턴 3: "색상코드 : 수량" (OCR이 dash를 :로 인식)
+    color_qty_patterns = [
+        r'\b([A-Z0-9][A-Z0-9/\-]*)\s*[-–—~:]\s*(\d{1,3})\b',  # dash 및 변형
+        r'(?:^|\s)([A-Z]\d{0,2}[A-Z]?)\s+(\d{1,2})(?:\s|$)',  # 알파벳으로 시작하는 짧은 코드 (1B 3, 2 5)
+    ]
 
-    # 제외 패턴: 명확한 비색상 라인만 제외
+    # 제외 패턴: 명확한 헤더/메타데이터 라인만 제외
+    # NOTE: 가격 패턴(.00)은 제외하지 않음 - 색상 라인과 공존 가능
     exclude_patterns = [
-        r'INVOICE',
-        r'NO\.',
-        r'\d{6,}',  # 6자리 이상 연속 숫자 (바코드, 인보이스 번호)
-        r'DATE',
-        r'PAGE',
-        r'TOTAL',
-        r'\.\d{2}\b',  # 가격 패턴 (7.00, 10.50)
+        r'\bINVOICE\s*(NO|NUMBER|#|DATE)',  # Invoice 헤더
+        r'\b(PACKED|ORDERED|SHIPPED|DESCRIPTION|EXTENDED)\b.*(PRICE|QTY)',  # 테이블 헤더
+        r'\bITEM\s*(NUMBER|CODE|#)',  # 아이템 헤더
+        r'\d{10,}',  # 10자리 이상 연속 숫자 (바코드, 인보이스 번호)
+        r'\bPAGE\s+\d+\s*(OF|/)',  # 페이지 번호 (PAGE 1 OF 3)
+        r'\b(SUB\s*)?TOTAL\s*:?\s*\$',  # 합계 금액
     ]
 
     # 패턴 매칭되는 라인 찾기 (구조 기반, DB 검증 없음)
@@ -107,16 +116,20 @@ def detect_color_regions_bbox(
     for i, line in enumerate(ocr_lines):
         text_upper = line.text.upper()
 
-        # 제외 패턴 확인
+        # 제외 패턴 확인 (헤더/메타 라인만 제외)
         should_exclude = any(re.search(pat, text_upper) for pat in exclude_patterns)
         if should_exclude:
             continue
 
-        # 색상-수량 패턴 매칭 (구조만 확인)
-        matches = re.findall(color_qty_pattern, text_upper)
-        if matches:
+        # 다중 패턴으로 색상-수량 매칭
+        all_matches = []
+        for pattern in color_qty_patterns:
+            matches = re.findall(pattern, text_upper)
+            all_matches.extend(matches)
+
+        if all_matches:
             # 구조 기반 감지: 길이 제한만 적용 (DB 검증은 파싱 단계로 이연)
-            valid_matches = [m for m in matches if 1 <= len(m[0]) <= 10]
+            valid_matches = [m for m in all_matches if 1 <= len(m[0]) <= 10]
 
             if valid_matches:
                 line.is_color_region = True
