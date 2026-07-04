@@ -45,6 +45,7 @@ def process_image(image_data: bytes) -> str:
     text = pytesseract.image_to_string(image, lang='eng', config=custom_config)
 
     logger.info(f"OCR 결과 길이: {len(text)} chars")
+    logger.debug(f"=== RAW OCR TEXT (process_image) ===\n{text}\n=== END RAW OCR TEXT ===")
     return text
 
 
@@ -158,6 +159,10 @@ def process_image_with_color_regions(image_data: bytes) -> Tuple[str, List[Color
     # 2. bbox 기반 OCR (image_to_data)
     ocr_lines, scale_factor = ocr_with_bbox(preprocessed, original_image.size)
     logger.info(f"bbox OCR: {len(ocr_lines)} lines, scale_factor={scale_factor:.2f}")
+
+    # RAW OCR 텍스트 로깅 (파싱/처리 전)
+    raw_ocr_text = "\n".join([line.text for line in ocr_lines])
+    logger.debug(f"=== RAW OCR TEXT (bbox) ===\n{raw_ocr_text}\n=== END RAW OCR TEXT ===")
 
     if not ocr_lines:
         return "", []
