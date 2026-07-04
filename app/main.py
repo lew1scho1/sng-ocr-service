@@ -151,7 +151,16 @@ async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
                     "color": item.color,
                     "quantity": item.quantity,
                     "unit_price": item.unit_price,
-                    "description": item.description
+                    "description": item.description,
+                    # DB 매칭용 확장 필드
+                    "raw_item_code": item.raw_item_code,
+                    "item_code_candidates": item.item_code_candidates,
+                    "description_tokens": {
+                        "type": item.description_tokens.type if item.description_tokens else None,
+                        "length": item.description_tokens.length if item.description_tokens else None,
+                        "pcs": item.description_tokens.pcs if item.description_tokens else None,
+                        "style": item.description_tokens.style if item.description_tokens else None,
+                    } if item.description_tokens else None
                 }
                 for item in result.line_items
             ],
@@ -228,7 +237,16 @@ async def create_ocr_job_sync_sng_multi(files: List[UploadFile] = File(...)):
                     "color": item.color,
                     "quantity": item.quantity,
                     "unit_price": item.unit_price,
-                    "description": item.description
+                    "description": item.description,
+                    # DB 매칭용 확장 필드
+                    "raw_item_code": item.raw_item_code,
+                    "item_code_candidates": item.item_code_candidates,
+                    "description_tokens": {
+                        "type": item.description_tokens.type if item.description_tokens else None,
+                        "length": item.description_tokens.length if item.description_tokens else None,
+                        "pcs": item.description_tokens.pcs if item.description_tokens else None,
+                        "style": item.description_tokens.style if item.description_tokens else None,
+                    } if item.description_tokens else None
                 }
                 for item in all_line_items
             ],
