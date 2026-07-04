@@ -69,12 +69,16 @@ def detect_color_regions_bbox(
     valid_colors: Optional[Set[str]] = None
 ) -> List[Tuple[int, int, List[int]]]:
     """
-    bbox 좌표 기반으로 색상-수량 영역 감지
+    bbox 좌표 기반으로 색상-수량 영역 감지 (구조 우선)
+
+    전략 변경:
+    - 감지 단계: 구조 패턴만으로 넓게 감지 (DB 검증 제거)
+    - 파싱 단계: DB 검증으로 후보 점수화 (Rails ProductMatcher)
 
     Args:
         ocr_lines: OCR 라인 목록
         image_size: 이미지 크기 (width, height)
-        valid_colors: 유효한 색상 목록 (DB에서 가져온 것). None이면 패턴 매칭만 사용
+        valid_colors: 미사용 (하위 호환성 유지, 파싱 단계로 이연)
 
     Returns:
         [(y_start, y_end, [line_indices]), ...] - 원본 이미지 픽셀 좌표 및 해당 라인 인덱스
@@ -82,12 +86,12 @@ def detect_color_regions_bbox(
     if not ocr_lines:
         return []
 
-    # 색상-수량 패턴: "색상코드 - 수량" 형태
-    # 색상코드: 알파벳/숫자 조합 (1-15자)
+    # 색상-수량 패턴: "색상코드 - 수량" 형태 (넓은 매칭)
+    # 색상코드: 알파벳/숫자 조합 (1-10자)
     # 수량: 1-3자리 숫자
     color_qty_pattern = r'\b([A-Z0-9][A-Z0-9/\-]*)\s*[-–—]\s*(\d{1,3})\b'
 
-    # 제외 패턴: 인보이스 번호, 긴 숫자열 등
+    # 제외 패턴: 명확한 비색상 라인만 제외
     exclude_patterns = [
         r'INVOICE',
         r'NO\.',
@@ -96,11 +100,9 @@ def detect_color_regions_bbox(
         r'PAGE',
         r'TOTAL',
         r'\.\d{2}\b',  # 가격 패턴 (7.00, 10.50)
-        r'\bS[A-Z]{4,}',  # 아이템 코드 (SOATX, SOBIDIS 등)
-        r'\b(OG|HR)\b',  # 설명 코드
     ]
 
-    # 패턴 매칭되는 라인 찾기
+    # 패턴 매칭되는 라인 찾기 (구조 기반, DB 검증 없음)
     color_line_indices = []
     for i, line in enumerate(ocr_lines):
         text_upper = line.text.upper()
@@ -110,19 +112,16 @@ def detect_color_regions_bbox(
         if should_exclude:
             continue
 
-        # 색상-수량 패턴 매칭
+        # 색상-수량 패턴 매칭 (구조만 확인)
         matches = re.findall(color_qty_pattern, text_upper)
         if matches:
-            # DB 색상 목록으로 검증 (있는 경우)
-            if valid_colors:
-                valid_matches = [m for m in matches if _is_color_in_db(m[0], valid_colors)]
-            else:
-                # DB 목록 없으면 길이 제한만 적용
-                valid_matches = [m for m in matches if 1 <= len(m[0]) <= 10]
+            # 구조 기반 감지: 길이 제한만 적용 (DB 검증은 파싱 단계로 이연)
+            valid_matches = [m for m in matches if 1 <= len(m[0]) <= 10]
 
             if valid_matches:
                 line.is_color_region = True
                 color_line_indices.append(i)
+                logger.debug(f"색상 영역 후보: line[{i}] = '{line.text}'")
 
     if not color_line_indices:
         return []
