@@ -5,11 +5,16 @@ OCR 데이터 모델 및 순수 함수 (pytesseract 비의존)
 """
 import re
 import logging
-from typing import List, Tuple, Optional, Set
+from typing import List, Tuple, Optional, Set, Dict, Any
 from dataclasses import dataclass, field
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
+
+# =============================================================================
+# OCR 설정
+# =============================================================================
 
 @dataclass
 class OcrConfig:
@@ -43,6 +48,10 @@ COLOR_REGION_OCR_CONFIG = OcrConfig(
 )
 
 
+# =============================================================================
+# 데이터 모델
+# =============================================================================
+
 @dataclass
 class OcrLine:
     """bbox 기반 OCR 라인"""
@@ -51,6 +60,37 @@ class OcrLine:
     y_bottom: int              # 라인 하단 Y 좌표
     confidence: float          # OCR 신뢰도
     is_color_region: bool = False  # 색상-수량 영역 여부
+
+
+class ColorPatternType(Enum):
+    """색상-수량 패턴 유형"""
+    SIMPLE = "simple"        # 1B - 2, 30 - 6
+    SLASH = "slash"          # P4/30 - 2, P27/30 - 6
+    COMPOUND = "compound"    # C-42730 - 4
+    NUMERIC = "numeric"      # 2 - 5, 613 - 3
+
+
+@dataclass
+class ColorLineCandidate:
+    """색상 라인 후보 (점수 기반)"""
+    line_index: int
+    text: str
+    score: float                    # 0.0 ~ 1.0
+    matched_patterns: List[str]     # 매칭된 패턴 유형들
+    color_qty_pairs: List[Tuple[str, int]]  # [(색상, 수량), ...]
+    pattern_types: List[ColorPatternType]
+    db_match_count: int = 0         # DB 매칭 색상 수 (가산점용)
+
+
+@dataclass
+class ColorRegionCandidate:
+    """색상 영역 후보 (그룹)"""
+    y_start: int
+    y_end: int
+    line_indices: List[int]
+    total_score: float
+    candidate_lines: List[ColorLineCandidate]
+    raw_line_texts: List[str]
 
 
 @dataclass
@@ -63,119 +103,364 @@ class ColorRegionResult:
     original_lines: List[int] = field(default_factory=list)  # 대체될 원본 라인 인덱스
 
 
+# =============================================================================
+# 색상 영역 감지 (Score-based Candidate Collector)
+# =============================================================================
+
+# 색상-수량 패턴 정의 (유형별)
+COLOR_QTY_PATTERNS = {
+    # Simple: 1B - 2, 30 - 6, 2 - 5
+    ColorPatternType.SIMPLE: [
+        r'\b([A-Z]?\d{1,3}[A-Z]?)\s*[-–—]\s*(\d{1,3})\b',  # 1B-2, 30-6
+        r'\b([A-Z]{1,2}\d?)\s*[-–—]\s*(\d{1,3})\b',        # 1B-2, P4-3
+    ],
+    # Slash: P4/30 - 2, P27/30 - 6
+    ColorPatternType.SLASH: [
+        r'\b([A-Z]?\d{1,3}/\d{1,3})\s*[-–—]\s*(\d{1,3})\b',    # P4/30-2
+        r'\b([A-Z]{1,2}\d{1,2}/\d{1,3})\s*[-–—]\s*(\d{1,3})\b', # P27/30-2
+    ],
+    # Compound: C-42730 - 4
+    ColorPatternType.COMPOUND: [
+        r'\b([A-Z]-?\d{4,6})\s*[-–—]\s*(\d{1,3})\b',       # C-42730-4
+        r'\b([A-Z]{2,}-\d{2,})\s*[-–—]\s*(\d{1,3})\b',     # OT-27-3
+    ],
+    # Numeric: 2 - 5, 613 - 3 (순수 숫자)
+    ColorPatternType.NUMERIC: [
+        r'(?:^|\s)(\d{1,3})\s*[-–—]\s*(\d{1,3})(?:\s|$)',  # 2-5, 613-3
+    ],
+}
+
+# 제외 패턴 (명확한 비색상 라인)
+EXCLUDE_PATTERNS = [
+    r'\bINVOICE\s*(NO|NUMBER|#|DATE)',  # Invoice 헤더
+    r'\b(PACKED|ORDERED|SHIPPED)\b.*\b(DESCRIPTION|PRICE|QTY)',  # 테이블 헤더
+    r'\bITEM\s*(NUMBER|CODE|#)',  # 아이템 헤더
+    r'\d{10,}',  # 10자리 이상 연속 숫자 (바코드, 인보이스 번호)
+    r'\bPAGE\s+\d+\s*(OF|/)',  # 페이지 번호
+    r'\b(SUB\s*)?TOTAL\s*:?\s*\$',  # 합계 금액
+]
+
+# 감점 패턴 (색상 줄 가능성 낮음)
+PENALTY_PATTERNS = [
+    (r'\b(ORGANIQUE|WATER|BODY|WAVE|CURL|TWIST|BRAID|DEEP|LOOSE|NATURAL)\b', -0.3),  # 설명 키워드
+    (r'\bS[A-Z]{4,}\d*\b', -0.4),  # 아이템 코드 (SOATX, SOBDX24)
+    (r'\b\d{1,3}\.\d{2}\s*\d{1,3}\.\d{2}\b', -0.2),  # 연속 가격 (7.00 42.00)
+]
+
+# 가산점 신호
+BONUS_SIGNALS = [
+    (r'[-–—]\s*\d{1,2}\s+[-–—]\s*\d{1,2}', 0.3),  # 복수 color-qty 토큰 (1B-2 30-6)
+    (r'^[A-Z0-9/\-\s]+$', 0.2),  # 라인이 색상 문자만 포함
+]
+
+# 점수 임계값
+CANDIDATE_SCORE_THRESHOLD = 0.3
+
+
 def detect_color_regions_bbox(
     ocr_lines: List[OcrLine],
     image_size: Tuple[int, int],
     valid_colors: Optional[Set[str]] = None
 ) -> List[Tuple[int, int, List[int]]]:
     """
-    bbox 좌표 기반으로 색상-수량 영역 감지 (구조 우선, 넓은 recall)
+    색상-수량 영역 후보 감지 (Score-based Candidate Collector)
 
-    전략 변경:
-    - 감지 단계: 구조 패턴만으로 넓게 감지 (DB 검증 제거)
-    - 파싱 단계: DB 검증으로 후보 점수화 (Rails ProductMatcher)
-
-    개선 (2024-07):
-    - 가격 패턴 제외 삭제 (색상 라인과 공존 가능)
-    - 다중 패턴으로 recall 향상
-    - 헤더 라인만 제외 (명확한 메타데이터)
+    전략:
+    - 감지 단계: 넓은 recall, 구조 점수 기반 후보 수집
+    - 검증 단계: 파서/DB에서 precision 회수 (후단 처리)
 
     Args:
         ocr_lines: OCR 라인 목록
         image_size: 이미지 크기 (width, height)
-        valid_colors: 미사용 (하위 호환성 유지, 파싱 단계로 이연)
+        valid_colors: DB 색상 목록 (가산점용, 탈락 조건 아님)
 
     Returns:
-        [(y_start, y_end, [line_indices]), ...] - 원본 이미지 픽셀 좌표 및 해당 라인 인덱스
+        [(y_start, y_end, [line_indices]), ...] - 후보 영역
     """
     if not ocr_lines:
         return []
 
-    # 색상-수량 패턴들 (넓은 매칭, 다중 패턴)
-    # 패턴 1: "색상코드 - 수량" (dash 포함, 기본)
-    # 패턴 2: "색상코드 ~ 수량" (OCR이 dash를 ~로 인식)
-    # 패턴 3: "색상코드 : 수량" (OCR이 dash를 :로 인식)
-    color_qty_patterns = [
-        r'\b([A-Z0-9][A-Z0-9/\-]*)\s*[-–—~:]\s*(\d{1,3})\b',  # dash 및 변형
-        r'(?:^|\s)([A-Z]\d{0,2}[A-Z]?)\s+(\d{1,2})(?:\s|$)',  # 알파벳으로 시작하는 짧은 코드 (1B 3, 2 5)
-    ]
-
-    # 제외 패턴: 명확한 헤더/메타데이터 라인만 제외
-    # NOTE: 가격 패턴(.00)은 제외하지 않음 - 색상 라인과 공존 가능
-    exclude_patterns = [
-        r'\bINVOICE\s*(NO|NUMBER|#|DATE)',  # Invoice 헤더
-        r'\b(PACKED|ORDERED|SHIPPED|DESCRIPTION|EXTENDED)\b.*(PRICE|QTY)',  # 테이블 헤더
-        r'\bITEM\s*(NUMBER|CODE|#)',  # 아이템 헤더
-        r'\d{10,}',  # 10자리 이상 연속 숫자 (바코드, 인보이스 번호)
-        r'\bPAGE\s+\d+\s*(OF|/)',  # 페이지 번호 (PAGE 1 OF 3)
-        r'\b(SUB\s*)?TOTAL\s*:?\s*\$',  # 합계 금액
-    ]
-
-    # 패턴 매칭되는 라인 찾기 (구조 기반, DB 검증 없음)
-    color_line_indices = []
+    # Phase 1: 라인별 점수 계산
+    line_candidates = []
     for i, line in enumerate(ocr_lines):
-        text_upper = line.text.upper()
+        candidate = score_color_line(i, line.text, valid_colors)
+        if candidate and candidate.score >= CANDIDATE_SCORE_THRESHOLD:
+            line.is_color_region = True
+            line_candidates.append(candidate)
+            logger.debug(
+                f"색상 후보: line[{i}] score={candidate.score:.2f} "
+                f"patterns={candidate.matched_patterns} text='{line.text[:50]}'"
+            )
 
-        # 제외 패턴 확인 (헤더/메타 라인만 제외)
-        should_exclude = any(re.search(pat, text_upper) for pat in exclude_patterns)
-        if should_exclude:
-            continue
-
-        # 다중 패턴으로 색상-수량 매칭
-        all_matches = []
-        for pattern in color_qty_patterns:
-            matches = re.findall(pattern, text_upper)
-            all_matches.extend(matches)
-
-        if all_matches:
-            # 구조 기반 감지: 길이 제한만 적용 (DB 검증은 파싱 단계로 이연)
-            valid_matches = [m for m in all_matches if 1 <= len(m[0]) <= 10]
-
-            if valid_matches:
-                line.is_color_region = True
-                color_line_indices.append(i)
-                logger.debug(f"색상 영역 후보: line[{i}] = '{line.text}'")
-
-    if not color_line_indices:
+    if not line_candidates:
+        logger.info("색상 후보 라인 없음")
         return []
 
-    # 연속된 색상 라인 그룹화 (인접 라인 병합)
+    logger.info(f"색상 후보 라인: {len(line_candidates)}개 (threshold={CANDIDATE_SCORE_THRESHOLD})")
+
+    # Phase 2: 인접 라인 그룹화
+    regions = group_candidate_lines(line_candidates, ocr_lines, image_size)
+
+    logger.info(f"색상 영역 감지: {len(regions)}개 영역")
+    for region in regions:
+        logger.debug(
+            f"  영역: y={region[0]}-{region[1]}, lines={region[2]}"
+        )
+
+    return regions
+
+
+def score_color_line(
+    line_index: int,
+    text: str,
+    valid_colors: Optional[Set[str]] = None
+) -> Optional[ColorLineCandidate]:
+    """
+    라인별 색상 후보 점수 계산
+
+    점수 구성:
+    - 기본: 패턴 매칭 (유형별 가중치)
+    - 가산: 복수 토큰, 짧은 라인, DB 매칭
+    - 감점: 설명 키워드, 아이템 코드 패턴
+    """
+    text_upper = text.upper().strip()
+
+    if not text_upper:
+        return None
+
+    # 제외 패턴 확인 (즉시 탈락)
+    for pattern in EXCLUDE_PATTERNS:
+        if re.search(pattern, text_upper):
+            return None
+
+    # 패턴 매칭 및 점수 계산
+    score = 0.0
+    matched_patterns = []
+    all_color_qty_pairs = []
+    pattern_types = []
+
+    # 유형별 패턴 매칭
+    for pattern_type, patterns in COLOR_QTY_PATTERNS.items():
+        for pattern in patterns:
+            matches = re.findall(pattern, text_upper)
+            if matches:
+                # 패턴 유형별 기본 점수
+                type_scores = {
+                    ColorPatternType.SIMPLE: 0.5,
+                    ColorPatternType.SLASH: 0.6,
+                    ColorPatternType.COMPOUND: 0.5,
+                    ColorPatternType.NUMERIC: 0.3,
+                }
+                base_score = type_scores.get(pattern_type, 0.4)
+
+                for match in matches:
+                    color, qty = match[0], int(match[1])
+                    # 길이 제한 (1-10자)
+                    if 1 <= len(color) <= 10:
+                        score += base_score
+                        matched_patterns.append(f"{pattern_type.value}:{color}")
+                        all_color_qty_pairs.append((color, qty))
+                        if pattern_type not in pattern_types:
+                            pattern_types.append(pattern_type)
+
+    if not all_color_qty_pairs:
+        return None
+
+    # 복수 토큰 보너스
+    if len(all_color_qty_pairs) >= 2:
+        score += 0.3
+        matched_patterns.append("bonus:multi_token")
+
+    # 라인 길이 보너스 (짧은 라인이 색상 줄일 가능성 높음)
+    if len(text_upper) <= 30:
+        score += 0.1
+    elif len(text_upper) <= 50:
+        score += 0.05
+
+    # 가산점 신호
+    for pattern, bonus in BONUS_SIGNALS:
+        if re.search(pattern, text_upper):
+            score += bonus
+            matched_patterns.append(f"bonus:{pattern[:20]}")
+
+    # 감점 패턴
+    for pattern, penalty in PENALTY_PATTERNS:
+        if re.search(pattern, text_upper):
+            score += penalty  # penalty는 음수
+            matched_patterns.append(f"penalty:{pattern[:20]}")
+
+    # DB 색상 매칭 (가산점, 탈락 조건 아님)
+    db_match_count = 0
+    if valid_colors:
+        for color, _ in all_color_qty_pairs:
+            if is_color_in_db_fuzzy(color, valid_colors):
+                db_match_count += 1
+                score += 0.2  # DB 매칭 가산점
+                matched_patterns.append(f"db_match:{color}")
+
+    # 점수 정규화 (0-1 범위)
+    score = max(0.0, min(1.0, score))
+
+    return ColorLineCandidate(
+        line_index=line_index,
+        text=text_upper,
+        score=score,
+        matched_patterns=matched_patterns,
+        color_qty_pairs=all_color_qty_pairs,
+        pattern_types=pattern_types,
+        db_match_count=db_match_count
+    )
+
+
+def group_candidate_lines(
+    candidates: List[ColorLineCandidate],
+    ocr_lines: List[OcrLine],
+    image_size: Tuple[int, int]
+) -> List[Tuple[int, int, List[int]]]:
+    """
+    후보 라인 그룹화 (인접성 + 컨텍스트)
+
+    개선:
+    - Y 거리 허용폭 확대 (70px)
+    - 중간 라인 포함 (후보 사이 비후보 라인)
+    - 너무 큰 그룹 분할
+    """
+    if not candidates:
+        return []
+
+    # 라인 인덱스 순 정렬
+    sorted_candidates = sorted(candidates, key=lambda c: c.line_index)
+
     groups = []
-    current_group = [color_line_indices[0]]
+    current_group = [sorted_candidates[0]]
 
-    for idx in color_line_indices[1:]:
-        # Y 좌표 기준으로 인접 여부 판단 (50px 이내)
-        prev_line = ocr_lines[current_group[-1]]
-        curr_line = ocr_lines[idx]
+    for candidate in sorted_candidates[1:]:
+        prev_candidate = current_group[-1]
+        prev_line = ocr_lines[prev_candidate.line_index]
+        curr_line = ocr_lines[candidate.line_index]
 
-        if curr_line.y_top - prev_line.y_bottom <= 50:
-            current_group.append(idx)
+        # Y 거리 계산
+        y_gap = curr_line.y_top - prev_line.y_bottom
+
+        # 라인 인덱스 거리 (중간 라인 수)
+        line_gap = candidate.line_index - prev_candidate.line_index - 1
+
+        # 그룹화 조건:
+        # 1. Y 거리 70px 이내
+        # 2. 중간 라인 2개 이하
+        if y_gap <= 70 and line_gap <= 2:
+            current_group.append(candidate)
         else:
             groups.append(current_group)
-            current_group = [idx]
+            current_group = [candidate]
 
     groups.append(current_group)
 
-    # 각 그룹의 Y 좌표 범위 계산
+    # 영역 좌표 계산
     regions = []
     image_height = image_size[1]
 
     for group in groups:
+        line_indices = [c.line_index for c in group]
+
         # 그룹 내 모든 라인의 Y 범위
-        y_start = min(ocr_lines[i].y_top for i in group)
-        y_end = max(ocr_lines[i].y_bottom for i in group)
+        y_start = min(ocr_lines[i].y_top for i in line_indices)
+        y_end = max(ocr_lines[i].y_bottom for i in line_indices)
 
-        # 여유 마진 추가 (위아래 20px)
-        y_start = max(0, y_start - 20)
-        y_end = min(image_height, y_end + 20)
+        # 중간 라인 포함 (후보 사이 비후보 라인)
+        min_idx = min(line_indices)
+        max_idx = max(line_indices)
+        expanded_indices = list(range(min_idx, max_idx + 1))
 
-        # 너무 작은 영역 제외
-        if y_end - y_start >= 30:
-            regions.append((y_start, y_end, group))
+        # 마진 추가 (위아래 25px)
+        y_start = max(0, y_start - 25)
+        y_end = min(image_height, y_end + 25)
 
-    logger.info(f"bbox 기반 색상 영역 감지: {len(regions)}개 영역")
+        # 최소 크기 확인
+        if y_end - y_start >= 25:
+            regions.append((y_start, y_end, expanded_indices))
+
     return regions
 
+
+# =============================================================================
+# DB 색상 매칭 (Fuzzy)
+# =============================================================================
+
+def is_color_in_db_fuzzy(color: str, valid_colors: Set[str]) -> bool:
+    """
+    색상이 DB 목록에 있는지 퍼지 매칭
+
+    Args:
+        color: 추출된 색상 코드
+        valid_colors: 유효한 색상 목록 (대문자)
+
+    Returns:
+        매칭되면 True
+    """
+    if not color or not valid_colors:
+        return False
+
+    color_upper = color.upper().strip()
+
+    # 정확히 일치
+    if color_upper in valid_colors:
+        return True
+
+    # OCR 오인식 변형 확인
+    variants = generate_color_variants(color_upper)
+    for variant in variants:
+        if variant in valid_colors:
+            return True
+
+    return False
+
+
+def generate_color_variants(color: str) -> List[str]:
+    """
+    OCR 오인식을 고려한 색상 변형 생성
+
+    Args:
+        color: 색상 코드 (대문자)
+
+    Returns:
+        변형 목록
+    """
+    variants = []
+
+    # I ↔ 1 변환
+    if 'I' in color:
+        variants.append(color.replace('I', '1'))
+    if '1' in color:
+        variants.append(color.replace('1', 'I'))
+
+    # O ↔ 0 변환
+    if 'O' in color:
+        variants.append(color.replace('O', '0'))
+    if '0' in color:
+        variants.append(color.replace('0', 'O'))
+
+    # 첫 글자 변환 (IB → 1B, OB → 0B 등)
+    if len(color) >= 2:
+        first_char = color[0]
+        rest = color[1:]
+        if first_char == 'I':
+            variants.append('1' + rest)
+        elif first_char == 'O':
+            variants.append('0' + rest)
+        elif first_char == 'L':
+            variants.append('1' + rest)
+        elif first_char == 'S':
+            variants.append('5' + rest)
+        elif first_char == 'Z':
+            variants.append('2' + rest)
+
+    return variants
+
+
+# =============================================================================
+# 텍스트 병합
+# =============================================================================
 
 def merge_by_replacement(ocr_lines: List[OcrLine], color_results: List[ColorRegionResult]) -> str:
     """
@@ -219,72 +504,15 @@ def merge_by_replacement(ocr_lines: List[OcrLine], color_results: List[ColorRegi
     return "\n".join(merged_lines)
 
 
+# =============================================================================
+# 하위 호환성 (deprecated)
+# =============================================================================
+
 def _is_color_in_db(color: str, valid_colors: Set[str]) -> bool:
-    """
-    색상이 DB 목록에 있는지 확인 (OCR 오인식 변형 포함)
-
-    Args:
-        color: 추출된 색상 코드
-        valid_colors: 유효한 색상 목록 (대문자)
-
-    Returns:
-        유효하면 True
-    """
-    if not color or not valid_colors:
-        return False
-
-    color_upper = color.upper().strip()
-
-    # 정확히 일치
-    if color_upper in valid_colors:
-        return True
-
-    # OCR 오인식 변형 확인
-    variants = _generate_color_variants(color_upper)
-    for variant in variants:
-        if variant in valid_colors:
-            return True
-
-    return False
+    """Deprecated: use is_color_in_db_fuzzy instead"""
+    return is_color_in_db_fuzzy(color, valid_colors)
 
 
 def _generate_color_variants(color: str) -> List[str]:
-    """
-    OCR 오인식을 고려한 색상 변형 생성
-
-    Args:
-        color: 색상 코드 (대문자)
-
-    Returns:
-        변형 목록
-    """
-    variants = []
-
-    # I ↔ 1 변환
-    if 'I' in color:
-        variants.append(color.replace('I', '1'))
-    if '1' in color:
-        variants.append(color.replace('1', 'I'))
-
-    # O ↔ 0 변환
-    if 'O' in color:
-        variants.append(color.replace('O', '0'))
-    if '0' in color:
-        variants.append(color.replace('0', 'O'))
-
-    # 첫 글자 변환 (IB → 1B, OB → 0B 등)
-    if len(color) >= 2:
-        first_char = color[0]
-        rest = color[1:]
-        if first_char == 'I':
-            variants.append('1' + rest)
-        elif first_char == 'O':
-            variants.append('0' + rest)
-        elif first_char == 'L':
-            variants.append('1' + rest)
-        elif first_char == 'S':
-            variants.append('5' + rest)
-        elif first_char == 'Z':
-            variants.append('2' + rest)
-
-    return variants
+    """Deprecated: use generate_color_variants instead"""
+    return generate_color_variants(color)
