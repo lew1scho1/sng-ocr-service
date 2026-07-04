@@ -143,7 +143,7 @@ async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
         logger.info(f"SNG OCR - FULL RAW TEXT END (Total: {len(raw_text)} chars)")
         logger.info("=" * 80)
 
-        # SNG 파서로 구조화된 데이터 추출
+        # SNG 파서로 구조화된 데이터 추출 (raw 데이터만)
         result = parse_sng_invoice(raw_text)
 
         return {
@@ -155,26 +155,19 @@ async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
             },
             "line_items": [
                 {
-                    "item_code": item.item_code,
+                    "item_code_raw": item.item_code_raw,
                     "color": item.color,
                     "quantity": item.quantity,
                     "unit_price": item.unit_price,
-                    "description": item.description,
-                    # DB 매칭용 확장 필드
-                    "raw_item_code": item.raw_item_code,
-                    "item_code_candidates": item.item_code_candidates,
-                    "description_tokens": {
-                        "type": item.description_tokens.type if item.description_tokens else None,
-                        "length": item.description_tokens.length if item.description_tokens else None,
-                        "pcs": item.description_tokens.pcs if item.description_tokens else None,
-                        "style": item.description_tokens.style if item.description_tokens else None,
-                    } if item.description_tokens else None
+                    "description_raw": item.description_raw,
+                    "qty_ordered": item.qty_ordered,
+                    "qty_shipped": item.qty_shipped
                 }
                 for item in result.line_items
             ],
             "line_item_count": len(result.line_items),
             "raw_text_preview": raw_text[:500] if raw_text else "",
-            "last_item_code": result.last_item_code,
+            "last_item_code_raw": result.last_item_code_raw,
             "last_unit_price": result.last_unit_price
         }
     except Exception as e:
@@ -279,7 +272,7 @@ async def create_ocr_job_sync_sng_multi(files: List[UploadFile] = File(...)):
             all_line_items.extend(result.line_items)
 
             # 다음 페이지를 위해 마지막 아이템 정보 저장
-            prev_item_code = result.last_item_code
+            prev_item_code = result.last_item_code_raw
             prev_unit_price = result.last_unit_price
 
             # 페이지별 결과 저장
@@ -287,7 +280,7 @@ async def create_ocr_job_sync_sng_multi(files: List[UploadFile] = File(...)):
                 "page": i + 1,
                 "filename": file.filename,
                 "item_count": len(result.line_items),
-                "last_item_code": result.last_item_code
+                "last_item_code_raw": result.last_item_code_raw
             })
 
         return {
@@ -300,20 +293,13 @@ async def create_ocr_job_sync_sng_multi(files: List[UploadFile] = File(...)):
             },
             "line_items": [
                 {
-                    "item_code": item.item_code,
+                    "item_code_raw": item.item_code_raw,
                     "color": item.color,
                     "quantity": item.quantity,
                     "unit_price": item.unit_price,
-                    "description": item.description,
-                    # DB 매칭용 확장 필드
-                    "raw_item_code": item.raw_item_code,
-                    "item_code_candidates": item.item_code_candidates,
-                    "description_tokens": {
-                        "type": item.description_tokens.type if item.description_tokens else None,
-                        "length": item.description_tokens.length if item.description_tokens else None,
-                        "pcs": item.description_tokens.pcs if item.description_tokens else None,
-                        "style": item.description_tokens.style if item.description_tokens else None,
-                    } if item.description_tokens else None
+                    "description_raw": item.description_raw,
+                    "qty_ordered": item.qty_ordered,
+                    "qty_shipped": item.qty_shipped
                 }
                 for item in all_line_items
             ],
@@ -384,22 +370,16 @@ def process_sng_ocr_job_sync(job_id: str, temp_path: str):
         # 3. SNG 파서로 구조화된 데이터 추출
         result = parse_sng_invoice(raw_text)
 
-        # 4. 라인 아이템 변환
+        # 4. 라인 아이템 변환 (raw 데이터만)
         line_items = [
             {
-                "item_code": item.item_code,
+                "item_code_raw": item.item_code_raw,
                 "color": item.color,
                 "quantity": item.quantity,
                 "unit_price": item.unit_price,
-                "description": item.description,
-                "raw_item_code": item.raw_item_code,
-                "item_code_candidates": item.item_code_candidates,
-                "description_tokens": {
-                    "type": item.description_tokens.type if item.description_tokens else None,
-                    "length": item.description_tokens.length if item.description_tokens else None,
-                    "pcs": item.description_tokens.pcs if item.description_tokens else None,
-                    "style": item.description_tokens.style if item.description_tokens else None,
-                } if item.description_tokens else None
+                "description_raw": item.description_raw,
+                "qty_ordered": item.qty_ordered,
+                "qty_shipped": item.qty_shipped
             }
             for item in result.line_items
         ]
