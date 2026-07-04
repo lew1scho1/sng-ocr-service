@@ -188,10 +188,14 @@ async def create_sng_ocr_job(
     SNG 인보이스 OCR 작업 생성 (비동기)
     즉시 job_id 반환, 백그라운드에서 처리
     """
+    logger.info(f"SNG OCR Job 요청 수신: filename={file.filename}, content_type={file.content_type}")
+
     job_id = str(uuid.uuid4())
+    logger.info(f"SNG OCR Job 생성: job_id={job_id}")
 
     # 파일 읽기
     image_data = await file.read()
+    logger.info(f"SNG OCR Job {job_id}: 파일 읽기 완료, size={len(image_data)} bytes")
 
     # Job 생성
     jobs[job_id] = {
@@ -210,6 +214,8 @@ async def create_sng_ocr_job(
 
     # 백그라운드에서 SNG OCR 처리
     background_tasks.add_task(process_sng_ocr_job, job_id, image_data)
+
+    logger.info(f"SNG OCR Job {job_id}: 응답 반환 (status=pending)")
 
     return JobStatus(**jobs[job_id])
 
