@@ -5,7 +5,7 @@ OCR 데이터 모델 및 순수 함수 (pytesseract 비의존)
 """
 import re
 import logging
-from typing import List, Tuple, Optional, Set, Dict, Any
+from typing import List, Tuple, Optional, Set, Dict, Any, Union
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -60,13 +60,14 @@ class OcrLine:
     y_bottom: int              # 라인 하단 Y 좌표
     confidence: float          # OCR 신뢰도
     is_color_region: bool = False  # 색상-수량 영역 여부
+    is_item_line: bool = False     # 아이템 시작 라인 여부 (블록 문맥용)
 
 
 class ColorPatternType(Enum):
     """색상-수량 패턴 유형"""
     SIMPLE = "simple"        # 1B - 2, 30 - 6
     SLASH = "slash"          # P4/30 - 2, P27/30 - 6
-    COMPOUND = "compound"    # C-42730 - 4
+    COMPOUND = "compound"    # C-42730 - 4, OT-27 - 3
     NUMERIC = "numeric"      # 2 - 5, 613 - 3
 
 
@@ -75,22 +76,25 @@ class ColorLineCandidate:
     """색상 라인 후보 (점수 기반)"""
     line_index: int
     text: str
-    score: float                    # 0.0 ~ 1.0
+    score: float                    # raw score (상대 비교용, 상한 없음)
     matched_patterns: List[str]     # 매칭된 패턴 유형들
-    color_qty_pairs: List[Tuple[str, int]]  # [(색상, 수량), ...]
+    color_qty_pairs: List[Tuple[str, int]]  # [(색상, 수량), ...] - dedupe 적용됨
     pattern_types: List[ColorPatternType]
     db_match_count: int = 0         # DB 매칭 색상 수 (가산점용)
+    unique_token_count: int = 0     # 고유 토큰 수
 
 
 @dataclass
 class ColorRegionCandidate:
-    """색상 영역 후보 (그룹)"""
+    """색상 영역 후보 (그룹) - 메타데이터 포함"""
     y_start: int
     y_end: int
     line_indices: List[int]
-    total_score: float
+    total_score: float              # 그룹 내 후보 점수 합계
+    avg_score: float                # 평균 점수 (상대 비교용)
     candidate_lines: List[ColorLineCandidate]
     raw_line_texts: List[str]
+    context_type: str = "unknown"   # "after_item", "standalone", "multi_item"
 
 
 @dataclass
@@ -104,7 +108,7 @@ class ColorRegionResult:
 
 
 # =============================================================================
-# 색상 영역 감지 (Score-based Candidate Collector)
+# 색상 영역 감지 (Score-based Candidate Collector v2)
 # =============================================================================
 
 # 색상-수량 패턴 정의 (유형별)
@@ -119,10 +123,10 @@ COLOR_QTY_PATTERNS = {
         r'\b([A-Z]?\d{1,3}/\d{1,3})\s*[-–—]\s*(\d{1,3})\b',    # P4/30-2
         r'\b([A-Z]{1,2}\d{1,2}/\d{1,3})\s*[-–—]\s*(\d{1,3})\b', # P27/30-2
     ],
-    # Compound: C-42730 - 4
+    # Compound: C-42730 - 4, OT-27 - 3 (OCR 변형 허용 확대)
     ColorPatternType.COMPOUND: [
-        r'\b([A-Z]-?\d{4,6})\s*[-–—]\s*(\d{1,3})\b',       # C-42730-4
-        r'\b([A-Z]{2,}-\d{2,})\s*[-–—]\s*(\d{1,3})\b',     # OT-27-3
+        r'\b([A-Z][\-\s]?\d{4,6})\s*[-–—]\s*(\d{1,3})\b',   # C-42730-4, C 42730-4
+        r'\b([A-Z]{2,}[\-\s]?\d{2,})\s*[-–—]\s*(\d{1,3})\b', # OT-27-3, OT 27-3
     ],
     # Numeric: 2 - 5, 613 - 3 (순수 숫자)
     ColorPatternType.NUMERIC: [
@@ -140,21 +144,33 @@ EXCLUDE_PATTERNS = [
     r'\b(SUB\s*)?TOTAL\s*:?\s*\$',  # 합계 금액
 ]
 
-# 감점 패턴 (색상 줄 가능성 낮음)
+# 아이템 라인 감지 패턴 (블록 문맥용)
+ITEM_LINE_PATTERNS = [
+    r'\bS[A-Z]{2,}\d{2,}\b',  # SOATX24, SOBDX24
+    r'\b\d+\s+\d+\s+S[A-Z]+',  # 12 12 STEST01
+]
+
+# 감점 패턴 (색상 줄 가능성 낮음) - 감점 값 조정
 PENALTY_PATTERNS = [
-    (r'\b(ORGANIQUE|WATER|BODY|WAVE|CURL|TWIST|BRAID|DEEP|LOOSE|NATURAL)\b', -0.3),  # 설명 키워드
-    (r'\bS[A-Z]{4,}\d*\b', -0.4),  # 아이템 코드 (SOATX, SOBDX24)
-    (r'\b\d{1,3}\.\d{2}\s*\d{1,3}\.\d{2}\b', -0.2),  # 연속 가격 (7.00 42.00)
+    (r'\b(ORGANIQUE|WATER|BODY|WAVE|CURL|TWIST|BRAID|DEEP|LOOSE|NATURAL)\b', -0.15),
+    (r'\bS[A-Z]{4,}\d*\b', -0.25),  # 아이템 코드
+    (r'\b\d{1,3}\.\d{2}\s+\d{1,3}\.\d{2}\b', -0.1),  # 연속 가격
 ]
 
-# 가산점 신호
+# 가산점 신호 - 가산 값 조정
 BONUS_SIGNALS = [
-    (r'[-–—]\s*\d{1,2}\s+[-–—]\s*\d{1,2}', 0.3),  # 복수 color-qty 토큰 (1B-2 30-6)
-    (r'^[A-Z0-9/\-\s]+$', 0.2),  # 라인이 색상 문자만 포함
+    (r'[-–—]\s*\d{1,2}\s+.*[-–—]\s*\d{1,2}', 0.15),  # 복수 color-qty 토큰
+    (r'^[A-Z0-9/\-\s]+$', 0.1),  # 라인이 색상 문자만 포함
 ]
 
-# 점수 임계값
-CANDIDATE_SCORE_THRESHOLD = 0.3
+# 점수 설정
+CANDIDATE_SCORE_THRESHOLD = 0.25  # 임계값 완화 (recall 향상)
+BASE_SCORES = {
+    ColorPatternType.SIMPLE: 0.35,
+    ColorPatternType.SLASH: 0.40,
+    ColorPatternType.COMPOUND: 0.35,
+    ColorPatternType.NUMERIC: 0.20,
+}
 
 
 def detect_color_regions_bbox(
@@ -163,11 +179,13 @@ def detect_color_regions_bbox(
     valid_colors: Optional[Set[str]] = None
 ) -> List[Tuple[int, int, List[int]]]:
     """
-    색상-수량 영역 후보 감지 (Score-based Candidate Collector)
+    색상-수량 영역 후보 감지 (Score-based Candidate Collector v2)
 
-    전략:
-    - 감지 단계: 넓은 recall, 구조 점수 기반 후보 수집
-    - 검증 단계: 파서/DB에서 precision 회수 (후단 처리)
+    개선점:
+    - ColorRegionCandidate 메타데이터 활용 (내부)
+    - 동일 토큰 중복 점수화 방지 (dedupe)
+    - 점수 포화 제거 (상대 비교 가능)
+    - 아이템 블록 문맥 인식
 
     Args:
         ocr_lines: OCR 라인 목록
@@ -175,12 +193,15 @@ def detect_color_regions_bbox(
         valid_colors: DB 색상 목록 (가산점용, 탈락 조건 아님)
 
     Returns:
-        [(y_start, y_end, [line_indices]), ...] - 후보 영역
+        [(y_start, y_end, [line_indices]), ...] - 하위 호환성 유지
     """
     if not ocr_lines:
         return []
 
-    # Phase 1: 라인별 점수 계산
+    # Phase 0: 아이템 라인 마킹 (블록 문맥용)
+    mark_item_lines(ocr_lines)
+
+    # Phase 1: 라인별 점수 계산 (dedupe 적용)
     line_candidates = []
     for i, line in enumerate(ocr_lines):
         candidate = score_color_line(i, line.text, valid_colors)
@@ -189,7 +210,7 @@ def detect_color_regions_bbox(
             line_candidates.append(candidate)
             logger.debug(
                 f"색상 후보: line[{i}] score={candidate.score:.2f} "
-                f"patterns={candidate.matched_patterns} text='{line.text[:50]}'"
+                f"tokens={candidate.unique_token_count} text='{line.text[:50]}'"
             )
 
     if not line_candidates:
@@ -198,16 +219,56 @@ def detect_color_regions_bbox(
 
     logger.info(f"색상 후보 라인: {len(line_candidates)}개 (threshold={CANDIDATE_SCORE_THRESHOLD})")
 
-    # Phase 2: 인접 라인 그룹화
-    regions = group_candidate_lines(line_candidates, ocr_lines, image_size)
+    # Phase 2: 인접 라인 그룹화 + 블록 문맥
+    region_candidates = group_candidate_lines_v2(line_candidates, ocr_lines, image_size)
 
-    logger.info(f"색상 영역 감지: {len(regions)}개 영역")
-    for region in regions:
+    logger.info(f"색상 영역 감지: {len(region_candidates)}개 영역")
+    for rc in region_candidates:
         logger.debug(
-            f"  영역: y={region[0]}-{region[1]}, lines={region[2]}"
+            f"  영역: y={rc.y_start}-{rc.y_end}, lines={rc.line_indices}, "
+            f"total_score={rc.total_score:.2f}, ctx={rc.context_type}"
         )
 
-    return regions
+    # 하위 호환: 튜플 반환
+    return [(rc.y_start, rc.y_end, rc.line_indices) for rc in region_candidates]
+
+
+def detect_color_regions_with_metadata(
+    ocr_lines: List[OcrLine],
+    image_size: Tuple[int, int],
+    valid_colors: Optional[Set[str]] = None
+) -> List[ColorRegionCandidate]:
+    """
+    색상 영역 감지 (메타데이터 포함 버전)
+
+    디버깅/분석용 - ColorRegionCandidate 객체 반환
+    """
+    if not ocr_lines:
+        return []
+
+    mark_item_lines(ocr_lines)
+
+    line_candidates = []
+    for i, line in enumerate(ocr_lines):
+        candidate = score_color_line(i, line.text, valid_colors)
+        if candidate and candidate.score >= CANDIDATE_SCORE_THRESHOLD:
+            line.is_color_region = True
+            line_candidates.append(candidate)
+
+    if not line_candidates:
+        return []
+
+    return group_candidate_lines_v2(line_candidates, ocr_lines, image_size)
+
+
+def mark_item_lines(ocr_lines: List[OcrLine]) -> None:
+    """아이템 시작 라인 마킹 (블록 문맥용)"""
+    for line in ocr_lines:
+        text_upper = line.text.upper()
+        for pattern in ITEM_LINE_PATTERNS:
+            if re.search(pattern, text_upper):
+                line.is_item_line = True
+                break
 
 
 def score_color_line(
@@ -216,12 +277,12 @@ def score_color_line(
     valid_colors: Optional[Set[str]] = None
 ) -> Optional[ColorLineCandidate]:
     """
-    라인별 색상 후보 점수 계산
+    라인별 색상 후보 점수 계산 (v2: dedupe + 상대 점수)
 
-    점수 구성:
-    - 기본: 패턴 매칭 (유형별 가중치)
-    - 가산: 복수 토큰, 짧은 라인, DB 매칭
-    - 감점: 설명 키워드, 아이템 코드 패턴
+    개선점:
+    - 동일 토큰 중복 점수화 방지
+    - 점수 상한 제거 (상대 비교 가능)
+    - 기본 점수 하향 조정
     """
     text_upper = text.upper().strip()
 
@@ -236,27 +297,24 @@ def score_color_line(
     # 패턴 매칭 및 점수 계산
     score = 0.0
     matched_patterns = []
-    all_color_qty_pairs = []
-    pattern_types = []
+    seen_tokens: Set[str] = set()  # dedupe용
+    all_color_qty_pairs: List[Tuple[str, int]] = []
+    pattern_types: List[ColorPatternType] = []
 
-    # 유형별 패턴 매칭
+    # 유형별 패턴 매칭 (dedupe 적용)
     for pattern_type, patterns in COLOR_QTY_PATTERNS.items():
         for pattern in patterns:
             matches = re.findall(pattern, text_upper)
             if matches:
-                # 패턴 유형별 기본 점수
-                type_scores = {
-                    ColorPatternType.SIMPLE: 0.5,
-                    ColorPatternType.SLASH: 0.6,
-                    ColorPatternType.COMPOUND: 0.5,
-                    ColorPatternType.NUMERIC: 0.3,
-                }
-                base_score = type_scores.get(pattern_type, 0.4)
+                base_score = BASE_SCORES.get(pattern_type, 0.3)
 
                 for match in matches:
                     color, qty = match[0], int(match[1])
-                    # 길이 제한 (1-10자)
-                    if 1 <= len(color) <= 10:
+                    token_key = f"{color}:{qty}"
+
+                    # 길이 제한 + dedupe
+                    if 1 <= len(color) <= 10 and token_key not in seen_tokens:
+                        seen_tokens.add(token_key)
                         score += base_score
                         matched_patterns.append(f"{pattern_type.value}:{color}")
                         all_color_qty_pairs.append((color, qty))
@@ -266,40 +324,42 @@ def score_color_line(
     if not all_color_qty_pairs:
         return None
 
-    # 복수 토큰 보너스
-    if len(all_color_qty_pairs) >= 2:
-        score += 0.3
-        matched_patterns.append("bonus:multi_token")
+    unique_token_count = len(all_color_qty_pairs)
 
-    # 라인 길이 보너스 (짧은 라인이 색상 줄일 가능성 높음)
-    if len(text_upper) <= 30:
-        score += 0.1
-    elif len(text_upper) <= 50:
-        score += 0.05
+    # 복수 토큰 보너스 (작게 조정)
+    if unique_token_count >= 2:
+        score += 0.1 * (unique_token_count - 1)  # 토큰당 0.1 추가
+        matched_patterns.append(f"bonus:multi_token({unique_token_count})")
+
+    # 라인 길이 보너스
+    if len(text_upper) <= 25:
+        score += 0.08
+    elif len(text_upper) <= 40:
+        score += 0.04
 
     # 가산점 신호
     for pattern, bonus in BONUS_SIGNALS:
         if re.search(pattern, text_upper):
             score += bonus
-            matched_patterns.append(f"bonus:{pattern[:20]}")
+            matched_patterns.append(f"bonus:{pattern[:15]}")
 
     # 감점 패턴
     for pattern, penalty in PENALTY_PATTERNS:
         if re.search(pattern, text_upper):
-            score += penalty  # penalty는 음수
-            matched_patterns.append(f"penalty:{pattern[:20]}")
+            score += penalty
+            matched_patterns.append(f"penalty:{pattern[:15]}")
 
-    # DB 색상 매칭 (가산점, 탈락 조건 아님)
+    # DB 색상 매칭 (가산점)
     db_match_count = 0
     if valid_colors:
         for color, _ in all_color_qty_pairs:
             if is_color_in_db_fuzzy(color, valid_colors):
                 db_match_count += 1
-                score += 0.2  # DB 매칭 가산점
+                score += 0.12
                 matched_patterns.append(f"db_match:{color}")
 
-    # 점수 정규화 (0-1 범위)
-    score = max(0.0, min(1.0, score))
+    # 점수 하한만 적용 (상한 제거)
+    score = max(0.0, score)
 
     return ColorLineCandidate(
         line_index=line_index,
@@ -308,22 +368,23 @@ def score_color_line(
         matched_patterns=matched_patterns,
         color_qty_pairs=all_color_qty_pairs,
         pattern_types=pattern_types,
-        db_match_count=db_match_count
+        db_match_count=db_match_count,
+        unique_token_count=unique_token_count
     )
 
 
-def group_candidate_lines(
+def group_candidate_lines_v2(
     candidates: List[ColorLineCandidate],
     ocr_lines: List[OcrLine],
     image_size: Tuple[int, int]
-) -> List[Tuple[int, int, List[int]]]:
+) -> List[ColorRegionCandidate]:
     """
-    후보 라인 그룹화 (인접성 + 컨텍스트)
+    후보 라인 그룹화 (v2: 블록 문맥 + 메타데이터)
 
-    개선:
-    - Y 거리 허용폭 확대 (70px)
-    - 중간 라인 포함 (후보 사이 비후보 라인)
-    - 너무 큰 그룹 분할
+    개선점:
+    - 아이템 라인 경계 인식 (다른 아이템으로 넘어가면 분리)
+    - ColorRegionCandidate 메타데이터 반환
+    - 문맥 유형 분류
     """
     if not candidates:
         return []
@@ -331,7 +392,7 @@ def group_candidate_lines(
     # 라인 인덱스 순 정렬
     sorted_candidates = sorted(candidates, key=lambda c: c.line_index)
 
-    groups = []
+    groups: List[List[ColorLineCandidate]] = []
     current_group = [sorted_candidates[0]]
 
     for candidate in sorted_candidates[1:]:
@@ -342,13 +403,22 @@ def group_candidate_lines(
         # Y 거리 계산
         y_gap = curr_line.y_top - prev_line.y_bottom
 
-        # 라인 인덱스 거리 (중간 라인 수)
+        # 라인 인덱스 거리
         line_gap = candidate.line_index - prev_candidate.line_index - 1
+
+        # 중간에 아이템 라인이 있는지 확인 (블록 경계)
+        has_item_boundary = False
+        if line_gap > 0:
+            for idx in range(prev_candidate.line_index + 1, candidate.line_index):
+                if idx < len(ocr_lines) and ocr_lines[idx].is_item_line:
+                    has_item_boundary = True
+                    break
 
         # 그룹화 조건:
         # 1. Y 거리 70px 이내
-        # 2. 중간 라인 2개 이하
-        if y_gap <= 70 and line_gap <= 2:
+        # 2. 중간 라인 3개 이하
+        # 3. 아이템 경계 없음
+        if y_gap <= 70 and line_gap <= 3 and not has_item_boundary:
             current_group.append(candidate)
         else:
             groups.append(current_group)
@@ -356,8 +426,8 @@ def group_candidate_lines(
 
     groups.append(current_group)
 
-    # 영역 좌표 계산
-    regions = []
+    # ColorRegionCandidate 생성
+    region_candidates = []
     image_height = image_size[1]
 
     for group in groups:
@@ -367,20 +437,57 @@ def group_candidate_lines(
         y_start = min(ocr_lines[i].y_top for i in line_indices)
         y_end = max(ocr_lines[i].y_bottom for i in line_indices)
 
-        # 중간 라인 포함 (후보 사이 비후보 라인)
+        # 중간 라인 포함
         min_idx = min(line_indices)
         max_idx = max(line_indices)
         expanded_indices = list(range(min_idx, max_idx + 1))
 
-        # 마진 추가 (위아래 25px)
+        # 마진 추가
         y_start = max(0, y_start - 25)
         y_end = min(image_height, y_end + 25)
 
         # 최소 크기 확인
-        if y_end - y_start >= 25:
-            regions.append((y_start, y_end, expanded_indices))
+        if y_end - y_start < 25:
+            continue
 
-    return regions
+        # 점수 계산
+        total_score = sum(c.score for c in group)
+        avg_score = total_score / len(group) if group else 0
+
+        # 문맥 유형 결정
+        context_type = determine_context_type(min_idx, ocr_lines)
+
+        # raw 텍스트 수집
+        raw_texts = [ocr_lines[i].text for i in expanded_indices if i < len(ocr_lines)]
+
+        region_candidates.append(ColorRegionCandidate(
+            y_start=y_start,
+            y_end=y_end,
+            line_indices=expanded_indices,
+            total_score=total_score,
+            avg_score=avg_score,
+            candidate_lines=group,
+            raw_line_texts=raw_texts,
+            context_type=context_type
+        ))
+
+    return region_candidates
+
+
+def determine_context_type(first_line_idx: int, ocr_lines: List[OcrLine]) -> str:
+    """영역의 문맥 유형 결정"""
+    # 바로 앞에 아이템 라인이 있는지
+    if first_line_idx > 0:
+        for i in range(first_line_idx - 1, max(0, first_line_idx - 3) - 1, -1):
+            if ocr_lines[i].is_item_line:
+                return "after_item"
+
+    # 여러 아이템에 걸쳐 있는지 (rare)
+    item_count = sum(1 for line in ocr_lines[:first_line_idx] if line.is_item_line)
+    if item_count > 1:
+        return "multi_item"
+
+    return "standalone"
 
 
 # =============================================================================
