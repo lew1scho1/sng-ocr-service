@@ -14,7 +14,11 @@ from datetime import datetime
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-from .ocr_service import process_image, extract_barcodes
+from .ocr_service import (
+    process_image,
+    extract_barcodes,
+    process_image_with_color_regions
+)
 from .parsers.sng_parser import parse_sng_invoice, to_dict as sng_to_dict
 
 app = FastAPI(
@@ -124,6 +128,8 @@ async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
     """
     SNG (Shake-N-Go) 인보이스 전용 OCR (단일 이미지)
 
+    PHASE 5: 색상-수량 영역 분리 OCR 적용
+
     추출 정보:
     - 헤더: Invoice NO, Invoice Date
     - 라인 아이템: ITEM_CODE + COLOR + QUANTITY + UNIT_PRICE
@@ -131,8 +137,9 @@ async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
     try:
         image_data = await file.read()
 
-        # OCR 처리
-        raw_text = process_image(image_data)
+        # OCR 처리 (PHASE 5+: bbox 기반 색상 영역 분리 + block merge)
+        # 새 구현에서는 merged_text가 이미 교체 완료된 텍스트
+        raw_text, color_results = process_image_with_color_regions(image_data)
 
         # 디버그: 전체 OCR 텍스트 로그 출력
         logger.info("=" * 80)
@@ -140,7 +147,7 @@ async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
         logger.info("=" * 80)
         logger.info(raw_text)
         logger.info("=" * 80)
-        logger.info(f"SNG OCR - FULL RAW TEXT END (Total: {len(raw_text)} chars)")
+        logger.info(f"SNG OCR - FULL RAW TEXT END (Total: {len(raw_text)} chars, color_regions: {len(color_results)})")
         logger.info("=" * 80)
 
         # SNG 파서로 구조화된 데이터 추출 (raw 데이터만)
@@ -156,7 +163,7 @@ async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
             "line_items": [
                 {
                     "item_code_raw": item.item_code_raw,
-                    "color": item.color,
+                    "color_raw": item.color_raw,
                     "quantity": item.quantity,
                     "unit_price": item.unit_price,
                     "description_raw": item.description_raw,
@@ -239,6 +246,8 @@ async def create_ocr_job_sync_sng_multi(files: List[UploadFile] = File(...)):
     """
     SNG (Shake-N-Go) 인보이스 전용 OCR (멀티 페이지)
 
+    PHASE 5+: bbox 기반 색상-수량 영역 분리 OCR + block merge 적용
+
     여러 이미지를 순차 처리하여 페이지 간 아이템 연결 지원
     - 페이지 2에서 아이템 코드 없이 색상만 있으면 페이지 1의 마지막 아이템에 연결
 
@@ -256,10 +265,10 @@ async def create_ocr_job_sync_sng_multi(files: List[UploadFile] = File(...)):
         for i, file in enumerate(files):
             image_data = await file.read()
 
-            # OCR 처리
-            raw_text = process_image(image_data)
+            # OCR 처리 (PHASE 5+: bbox 기반 색상 영역 분리 + block merge)
+            raw_text, color_results = process_image_with_color_regions(image_data)
 
-            logger.info(f"SNG OCR - Page {i + 1}/{len(files)}, {len(raw_text)} chars")
+            logger.info(f"SNG OCR - Page {i + 1}/{len(files)}, {len(raw_text)} chars, color_regions: {len(color_results)}")
 
             # SNG 파서로 구조화된 데이터 추출 (이전 페이지 정보 전달)
             result = parse_sng_invoice(raw_text, prev_item_code, prev_unit_price)
@@ -294,7 +303,7 @@ async def create_ocr_job_sync_sng_multi(files: List[UploadFile] = File(...)):
             "line_items": [
                 {
                     "item_code_raw": item.item_code_raw,
-                    "color": item.color,
+                    "color_raw": item.color_raw,
                     "quantity": item.quantity,
                     "unit_price": item.unit_price,
                     "description_raw": item.description_raw,
@@ -353,6 +362,8 @@ def process_sng_ocr_job_sync(job_id: str, temp_path: str):
     별도 스레드에서 SNG OCR 처리 (동기 함수)
 
     HTTP 응답과 완전히 분리되어 실행됨
+
+    PHASE 5+: bbox 기반 색상-수량 영역 분리 OCR + block merge 적용
     """
     try:
         logger.info(f"Job {job_id}: OCR 처리 시작")
@@ -363,18 +374,18 @@ def process_sng_ocr_job_sync(job_id: str, temp_path: str):
             image_data = f.read()
         logger.info(f"Job {job_id}: 이미지 로드 완료, size={len(image_data)} bytes")
 
-        # 2. OCR 처리
-        raw_text = process_image(image_data)
-        logger.info(f"Job {job_id}: OCR 완료, text_length={len(raw_text)}")
+        # 2. OCR 처리 (PHASE 5+: bbox 기반 색상 영역 분리 + block merge)
+        raw_text, color_results = process_image_with_color_regions(image_data)
+        logger.info(f"Job {job_id}: OCR 완료, text_length={len(raw_text)}, color_regions={len(color_results)}")
 
         # 3. SNG 파서로 구조화된 데이터 추출
         result = parse_sng_invoice(raw_text)
 
-        # 4. 라인 아이템 변환 (raw 데이터만)
+        # 4. 라인 아이템 변환 (raw 데이터만 - 동기 API와 동일 스키마)
         line_items = [
             {
                 "item_code_raw": item.item_code_raw,
-                "color": item.color,
+                "color_raw": item.color_raw,  # 동기 API와 동일하게 color_raw 사용
                 "quantity": item.quantity,
                 "unit_price": item.unit_price,
                 "description_raw": item.description_raw,

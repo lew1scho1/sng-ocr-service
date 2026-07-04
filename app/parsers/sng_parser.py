@@ -1,13 +1,15 @@
 """
-SNG (Shake-N-Go) 인보이스 파서 (단순화 버전)
+SNG (Shake-N-Go) 인보이스 파서 (Raw Extraction 버전)
 
-역할: Extraction + Line Segmentation + 보편적 OCR 보정
-- 라인 분리 및 구조 파싱 (2줄 가격, 4열 색상-수량)
-- 기본 노이즈 제거
-- 색상 OCR 보정 (IB→1B)
-- 수량 OCR 보정
+역할: 순수 Extraction만 담당
+- 라인 분리 및 구조 파싱
+- 기본 노이즈 제거 (패턴 매칭 위한 최소한의 정규화)
+- Raw 값 반환 (item_code_raw, color_raw, description_raw)
 
-item_code 보정 및 DB 매칭은 Rails에서 처리
+OCR 보정 및 DB 매칭은 Rails ProductMatcher에서 처리:
+- 색상 보정 (IB→1B, O→0 등)
+- 아이템 코드 보정
+- 색상 후보 생성
 """
 
 import re
@@ -28,7 +30,6 @@ QTY_OCR_MAP = {
     ')': '', '(': '', ' ': ''
 }
 
-
 class ParserState(Enum):
     """파서 상태 머신"""
     IDLE = auto()           # 아이템 찾는 중
@@ -45,10 +46,10 @@ class SngInvoiceHeader:
 
 @dataclass
 class SngLineItem:
-    """라인 아이템 (raw 데이터)"""
-    item_code_raw: str              # OCR 원본 아이템 코드 (보정 없음)
-    color: str                      # 색상 (IB→1B 보정만 적용)
-    quantity: int                   # 수량
+    """라인 아이템 (raw 데이터 - 보정 없음)"""
+    item_code_raw: str              # OCR 원본 아이템 코드
+    color_raw: str                  # OCR 원본 색상 (보정 없음, Rails에서 처리)
+    quantity: int                   # 수량 (파싱용 정수 변환만 적용)
     unit_price: Optional[float] = None
     description_raw: Optional[str] = None  # OCR 원본 설명
     qty_ordered: Optional[int] = None
@@ -115,24 +116,6 @@ def normalize_qty_string(s: str) -> Optional[int]:
     except ValueError:
         logger.debug(f"수량 변환 실패: '{s}' → '{cleaned}'")
         return None
-
-
-def normalize_color_code(color: str) -> str:
-    """
-    색상 코드 OCR 보정 (보편적)
-
-    IB → 1B, I → 1
-    """
-    color = color.upper().strip()
-
-    # IB → 1B
-    if color.startswith('I') and len(color) >= 2 and color[1] == 'B':
-        color = '1' + color[1:]
-    # 단독 I → 1
-    elif color == 'I':
-        color = '1'
-
-    return color
 
 
 def parse_sng_invoice(text: str, prev_item_code: Optional[str] = None,
@@ -234,7 +217,7 @@ def extract_line_items(text: str, prev_item_code: Optional[str] = None,
         if current_item_code_raw and not current_has_colors:
             line_items.append(SngLineItem(
                 item_code_raw=current_item_code_raw,
-                color="",
+                color_raw="",  # 색상 없음
                 quantity=current_qty_shipped,
                 unit_price=current_unit_price,
                 description_raw=current_description_raw,
@@ -320,21 +303,18 @@ def extract_line_items(text: str, prev_item_code: Optional[str] = None,
                 logger.info(f"가격: {current_unit_price}")
                 state = ParserState.COLOR_COLLECT
 
-        # 색상-수량 추출
+        # 색상-수량 추출 (raw 값 그대로)
         if current_item_code_raw:
             color_qty_matches = re.findall(color_qty_pattern, line_upper)
 
             for match in color_qty_matches:
-                raw_color = match[0].strip()
+                color_raw = match[0].strip()  # 보정 없이 원본 그대로
                 quantity = int(match[1])
 
-                # 색상 OCR 보정 (보편적: IB→1B)
-                color = normalize_color_code(raw_color)
-
-                if is_valid_color(color):
+                if is_valid_color(color_raw):
                     line_items.append(SngLineItem(
                         item_code_raw=current_item_code_raw,
-                        color=color,
+                        color_raw=color_raw,  # raw 값 그대로 저장
                         quantity=quantity,
                         unit_price=current_unit_price,
                         description_raw=current_description_raw,
@@ -342,7 +322,7 @@ def extract_line_items(text: str, prev_item_code: Optional[str] = None,
                         qty_shipped=current_qty_shipped
                     ))
                     current_has_colors = True
-                    logger.debug(f"색상-수량: {current_item_code_raw} - {color} x {quantity}")
+                    logger.debug(f"색상-수량: {current_item_code_raw} - {color_raw} x {quantity}")
 
             if color_qty_matches:
                 state = ParserState.COLOR_COLLECT
@@ -378,7 +358,7 @@ def to_dict(result: SngInvoiceResult) -> dict:
         "line_items": [
             {
                 "item_code_raw": item.item_code_raw,
-                "color": item.color,
+                "color_raw": item.color_raw,  # raw 값 그대로
                 "quantity": item.quantity,
                 "unit_price": item.unit_price,
                 "description_raw": item.description_raw,
