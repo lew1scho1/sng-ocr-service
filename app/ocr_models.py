@@ -76,15 +76,43 @@ def detect_color_regions_bbox(
     if not ocr_lines:
         return []
 
-    # 색상-수량 패턴
-    color_qty_pattern = r'[A-Z0-9][A-Z0-9/]*\s*[-–—]\s*\d{1,3}'
+    # 색상-수량 패턴 (더 엄격하게)
+    # - 색상: 1-4자 (숫자, 숫자+B, 숫자/숫자 형식)
+    # - 하이픈
+    # - 수량: 1-3자리 숫자
+    # 예: "1B - 3", "2 - 5", "30 - 2", "1B/30 - 3"
+    color_qty_pattern = r'\b(\d{1,2}[A-Z]?(?:/\d{1,2}[A-Z]?)?)\s*[-–—]\s*(\d{1,3})\b'
+
+    # 제외 패턴: 인보이스 번호, 긴 숫자열 등
+    exclude_patterns = [
+        r'INVOICE',
+        r'NO\.',
+        r'\d{6,}',  # 6자리 이상 연속 숫자 (바코드, 인보이스 번호)
+        r'DATE',
+        r'PAGE',
+        r'TOTAL',
+        r'\.\d{2}\b',  # 가격 패턴 (7.00, 10.50)
+    ]
 
     # 패턴 매칭되는 라인 찾기
     color_line_indices = []
     for i, line in enumerate(ocr_lines):
-        if re.search(color_qty_pattern, line.text.upper()):
-            line.is_color_region = True
-            color_line_indices.append(i)
+        text_upper = line.text.upper()
+
+        # 제외 패턴 확인
+        should_exclude = any(re.search(pat, text_upper) for pat in exclude_patterns)
+        if should_exclude:
+            continue
+
+        # 색상-수량 패턴 매칭 (최소 1개 이상 필요)
+        matches = re.findall(color_qty_pattern, text_upper)
+        if matches:
+            # 매칭된 색상이 유효한지 추가 검증
+            # 색상 코드는 보통 1-4자: 1, 1B, 30, 1B/30
+            valid_matches = [m for m in matches if len(m[0]) <= 5]
+            if valid_matches:
+                line.is_color_region = True
+                color_line_indices.append(i)
 
     if not color_line_indices:
         return []
