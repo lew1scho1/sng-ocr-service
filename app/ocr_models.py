@@ -5,7 +5,7 @@ OCR 데이터 모델 및 순수 함수 (pytesseract 비의존)
 """
 import re
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Set
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -65,10 +65,16 @@ class ColorRegionResult:
 
 def detect_color_regions_bbox(
     ocr_lines: List[OcrLine],
-    image_size: Tuple[int, int]
+    image_size: Tuple[int, int],
+    valid_colors: Optional[Set[str]] = None
 ) -> List[Tuple[int, int, List[int]]]:
     """
     bbox 좌표 기반으로 색상-수량 영역 감지
+
+    Args:
+        ocr_lines: OCR 라인 목록
+        image_size: 이미지 크기 (width, height)
+        valid_colors: 유효한 색상 목록 (DB에서 가져온 것). None이면 패턴 매칭만 사용
 
     Returns:
         [(y_start, y_end, [line_indices]), ...] - 원본 이미지 픽셀 좌표 및 해당 라인 인덱스
@@ -76,12 +82,10 @@ def detect_color_regions_bbox(
     if not ocr_lines:
         return []
 
-    # 색상-수량 패턴 (더 엄격하게)
-    # - 색상: 1-4자 (숫자, 숫자+B, 숫자/숫자 형식)
-    # - 하이픈
-    # - 수량: 1-3자리 숫자
-    # 예: "1B - 3", "2 - 5", "30 - 2", "1B/30 - 3"
-    color_qty_pattern = r'\b(\d{1,2}[A-Z]?(?:/\d{1,2}[A-Z]?)?)\s*[-–—]\s*(\d{1,3})\b'
+    # 색상-수량 패턴: "색상코드 - 수량" 형태
+    # 색상코드: 알파벳/숫자 조합 (1-15자)
+    # 수량: 1-3자리 숫자
+    color_qty_pattern = r'\b([A-Z0-9][A-Z0-9/\-]*)\s*[-–—]\s*(\d{1,3})\b'
 
     # 제외 패턴: 인보이스 번호, 긴 숫자열 등
     exclude_patterns = [
@@ -92,6 +96,8 @@ def detect_color_regions_bbox(
         r'PAGE',
         r'TOTAL',
         r'\.\d{2}\b',  # 가격 패턴 (7.00, 10.50)
+        r'\bS[A-Z]{4,}',  # 아이템 코드 (SOATX, SOBIDIS 등)
+        r'\b(OG|HR)\b',  # 설명 코드
     ]
 
     # 패턴 매칭되는 라인 찾기
@@ -104,12 +110,16 @@ def detect_color_regions_bbox(
         if should_exclude:
             continue
 
-        # 색상-수량 패턴 매칭 (최소 1개 이상 필요)
+        # 색상-수량 패턴 매칭
         matches = re.findall(color_qty_pattern, text_upper)
         if matches:
-            # 매칭된 색상이 유효한지 추가 검증
-            # 색상 코드는 보통 1-4자: 1, 1B, 30, 1B/30
-            valid_matches = [m for m in matches if len(m[0]) <= 5]
+            # DB 색상 목록으로 검증 (있는 경우)
+            if valid_colors:
+                valid_matches = [m for m in matches if _is_color_in_db(m[0], valid_colors)]
+            else:
+                # DB 목록 없으면 길이 제한만 적용
+                valid_matches = [m for m in matches if 1 <= len(m[0]) <= 10]
+
             if valid_matches:
                 line.is_color_region = True
                 color_line_indices.append(i)
@@ -195,3 +205,74 @@ def merge_by_replacement(ocr_lines: List[OcrLine], color_results: List[ColorRegi
         # replaced_indices에만 있는 경우 (나머지 라인): 건너뜀
 
     return "\n".join(merged_lines)
+
+
+def _is_color_in_db(color: str, valid_colors: Set[str]) -> bool:
+    """
+    색상이 DB 목록에 있는지 확인 (OCR 오인식 변형 포함)
+
+    Args:
+        color: 추출된 색상 코드
+        valid_colors: 유효한 색상 목록 (대문자)
+
+    Returns:
+        유효하면 True
+    """
+    if not color or not valid_colors:
+        return False
+
+    color_upper = color.upper().strip()
+
+    # 정확히 일치
+    if color_upper in valid_colors:
+        return True
+
+    # OCR 오인식 변형 확인
+    variants = _generate_color_variants(color_upper)
+    for variant in variants:
+        if variant in valid_colors:
+            return True
+
+    return False
+
+
+def _generate_color_variants(color: str) -> List[str]:
+    """
+    OCR 오인식을 고려한 색상 변형 생성
+
+    Args:
+        color: 색상 코드 (대문자)
+
+    Returns:
+        변형 목록
+    """
+    variants = []
+
+    # I ↔ 1 변환
+    if 'I' in color:
+        variants.append(color.replace('I', '1'))
+    if '1' in color:
+        variants.append(color.replace('1', 'I'))
+
+    # O ↔ 0 변환
+    if 'O' in color:
+        variants.append(color.replace('O', '0'))
+    if '0' in color:
+        variants.append(color.replace('0', 'O'))
+
+    # 첫 글자 변환 (IB → 1B, OB → 0B 등)
+    if len(color) >= 2:
+        first_char = color[0]
+        rest = color[1:]
+        if first_char == 'I':
+            variants.append('1' + rest)
+        elif first_char == 'O':
+            variants.append('0' + rest)
+        elif first_char == 'L':
+            variants.append('1' + rest)
+        elif first_char == 'S':
+            variants.append('5' + rest)
+        elif first_char == 'Z':
+            variants.append('2' + rest)
+
+    return variants

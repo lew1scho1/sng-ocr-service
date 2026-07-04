@@ -16,7 +16,16 @@ from .ocr_models import (
     merge_by_replacement,
 )
 
+# DB 색상 목록 연동
+from .color_validator import get_valid_colors, preload_colors
+
 logger = logging.getLogger(__name__)
+
+# 서비스 시작 시 색상 목록 미리 로드
+try:
+    preload_colors()
+except Exception as e:
+    logger.warning(f"색상 목록 preload 실패 (API 미연결): {e}")
 
 
 def process_image(image_data: bytes) -> str:
@@ -153,8 +162,10 @@ def process_image_with_color_regions(image_data: bytes) -> Tuple[str, List[Color
     if not ocr_lines:
         return "", []
 
-    # 3. 색상-수량 영역 감지 (bbox 좌표 기반)
-    color_regions = detect_color_regions_bbox(ocr_lines, original_image.size)
+    # 3. 색상-수량 영역 감지 (bbox 좌표 기반 + DB 색상 목록 검증)
+    valid_colors = get_valid_colors()
+    logger.info(f"DB 색상 목록: {len(valid_colors)}개 로드됨")
+    color_regions = detect_color_regions_bbox(ocr_lines, original_image.size, valid_colors)
 
     if not color_regions:
         # 색상 영역 없으면 원본 텍스트 그대로 반환
