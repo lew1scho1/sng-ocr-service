@@ -7,3 +7,5 @@ services:
     envVars:
       - key: PORT
         value: "8000"
+      - key: RAILS_API_URL
+        value: "https://hairsearcherapp.onrender.com"

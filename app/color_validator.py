@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 logger = logging.getLogger(__name__)
 
 # 환경변수
-RAILS_API_URL = os.getenv("RAILS_API_URL", "https://sng-search.onrender.com")
+RAILS_API_URL = os.getenv("RAILS_API_URL", "https://hairsearcherapp.onrender.com")
 COMPANY_CODE = os.getenv("COMPANY_CODE", "SNG")
 
 # 캐시
