@@ -41,6 +41,11 @@ class JobStatus(BaseModel):
     barcodes: Optional[list] = None
     raw_text: Optional[str] = None
     error: Optional[str] = None
+    # SNG 전용 필드
+    company: Optional[str] = None
+    header: Optional[dict] = None
+    line_items: Optional[list] = None
+    line_item_count: Optional[int] = None
 
 
 class OcrRequest(BaseModel):
@@ -174,6 +179,41 @@ async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/v1/ocr/jobs/sng", response_model=JobStatus)
+async def create_sng_ocr_job(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
+    """
+    SNG 인보이스 OCR 작업 생성 (비동기)
+    즉시 job_id 반환, 백그라운드에서 처리
+    """
+    job_id = str(uuid.uuid4())
+
+    # 파일 읽기
+    image_data = await file.read()
+
+    # Job 생성
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "created_at": datetime.utcnow().isoformat(),
+        "completed_at": None,
+        "barcodes": None,
+        "raw_text": None,
+        "error": None,
+        "company": "SNG",
+        "header": None,
+        "line_items": None,
+        "line_item_count": None
+    }
+
+    # 백그라운드에서 SNG OCR 처리
+    background_tasks.add_task(process_sng_ocr_job, job_id, image_data)
+
+    return JobStatus(**jobs[job_id])
+
+
 @app.post("/api/v1/ocr/jobs/sync/sng/multi")
 async def create_ocr_job_sync_sng_multi(files: List[UploadFile] = File(...)):
     """
@@ -288,6 +328,63 @@ async def process_ocr_job(job_id: str, image_data: bytes):
         })
 
     except Exception as e:
+        jobs[job_id].update({
+            "status": "failed",
+            "completed_at": datetime.utcnow().isoformat(),
+            "error": str(e)
+        })
+
+
+async def process_sng_ocr_job(job_id: str, image_data: bytes):
+    """
+    백그라운드에서 SNG OCR 처리
+    """
+    try:
+        jobs[job_id]["status"] = "processing"
+
+        # OCR 처리
+        raw_text = process_image(image_data)
+
+        # SNG 파서로 구조화된 데이터 추출
+        result = parse_sng_invoice(raw_text)
+
+        # 라인 아이템 변환
+        line_items = [
+            {
+                "item_code": item.item_code,
+                "color": item.color,
+                "quantity": item.quantity,
+                "unit_price": item.unit_price,
+                "description": item.description,
+                "raw_item_code": item.raw_item_code,
+                "item_code_candidates": item.item_code_candidates,
+                "description_tokens": {
+                    "type": item.description_tokens.type if item.description_tokens else None,
+                    "length": item.description_tokens.length if item.description_tokens else None,
+                    "pcs": item.description_tokens.pcs if item.description_tokens else None,
+                    "style": item.description_tokens.style if item.description_tokens else None,
+                } if item.description_tokens else None
+            }
+            for item in result.line_items
+        ]
+
+        jobs[job_id].update({
+            "status": "completed",
+            "completed_at": datetime.utcnow().isoformat(),
+            "company": "SNG",
+            "header": {
+                "invoice_number": result.header.invoice_number,
+                "invoice_date": result.header.invoice_date
+            },
+            "line_items": line_items,
+            "line_item_count": len(line_items),
+            "raw_text": raw_text[:1000] if raw_text else ""
+        })
+
+        logger.info(f"SNG OCR Job {job_id} completed: {len(line_items)} items")
+
+    except Exception as e:
+        logger.error(f"SNG OCR Job {job_id} failed: {str(e)}")
         jobs[job_id].update({
             "status": "failed",
             "completed_at": datetime.utcnow().isoformat(),
