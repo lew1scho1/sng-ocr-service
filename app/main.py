@@ -123,6 +123,84 @@ async def create_ocr_job_sync(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/v1/ocr/debug/sng")
+async def debug_ocr_sng(file: UploadFile = File(...)):
+    """
+    SNG OCR 디버그 엔드포인트
+
+    raw OCR 텍스트 및 파싱 과정 전체를 반환합니다.
+    - raw_ocr_text: 전처리 직후 OCR 원본 텍스트 (파싱 전)
+    - merged_text: 색상 영역 재OCR 후 병합된 텍스트
+    - color_regions: 감지된 색상 영역 정보
+    - parsed_result: 최종 파싱 결과
+    """
+    try:
+        from .ocr_service import ocr_with_bbox, preprocess_image
+        from PIL import Image
+        import io
+
+        image_data = await file.read()
+
+        # 1. 이미지 로드 및 전처리
+        image = Image.open(io.BytesIO(image_data))
+        original_size = image.size
+        preprocessed = preprocess_image(image)
+
+        # 2. bbox 기반 OCR (raw 텍스트)
+        ocr_lines, scale_factor = ocr_with_bbox(preprocessed, original_size)
+        raw_ocr_text = "\n".join([line.text for line in ocr_lines])
+
+        # 3. 색상 영역 처리 및 병합
+        merged_text, color_results = process_image_with_color_regions(image_data)
+
+        # 4. 파싱
+        result = parse_sng_invoice(merged_text)
+
+        return {
+            "success": True,
+            "debug": {
+                "raw_ocr_text": raw_ocr_text,  # 파싱 전 원본 OCR
+                "raw_ocr_lines": len(ocr_lines),
+                "merged_text": merged_text,     # 색상 영역 재OCR 후 병합된 텍스트
+                "color_regions_detected": len(color_results),
+                "color_region_details": [
+                    {
+                        "y_start": cr.y_start,
+                        "y_end": cr.y_end,
+                        "region_text": cr.region_text,
+                        "original_lines": cr.original_lines
+                    }
+                    for cr in color_results
+                ]
+            },
+            "parsed_result": {
+                "header": {
+                    "invoice_number": result.header.invoice_number,
+                    "invoice_date": result.header.invoice_date
+                },
+                "line_items": [
+                    {
+                        "item_code_raw": item.item_code_raw,
+                        "color_raw": item.color_raw,
+                        "quantity": item.quantity,
+                        "unit_price": item.unit_price,
+                        "description_raw": item.description_raw
+                    }
+                    for item in result.line_items
+                ],
+                "line_item_count": len(result.line_items)
+            }
+        }
+    except Exception as e:
+        logger.error(f"SNG Debug OCR Error: {str(e)}")
+        import traceback
+        return {
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
+
 @app.post("/api/v1/ocr/jobs/sync/sng")
 async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
     """
