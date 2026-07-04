@@ -5,6 +5,9 @@ from typing import Optional, List
 import uuid
 import asyncio
 import logging
+import threading
+import tempfile
+import os
 from datetime import datetime
 
 # 로깅 설정
@@ -179,25 +182,37 @@ async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/v1/ocr/jobs/sng", response_model=JobStatus)
-async def create_sng_ocr_job(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...)
-):
+@app.post("/api/v1/ocr/jobs/sng")
+async def create_sng_ocr_job(file: UploadFile = File(...)):
     """
     SNG 인보이스 OCR 작업 생성 (비동기)
-    즉시 job_id 반환, 백그라운드에서 처리
+
+    핵심: HTTP 응답과 OCR 처리를 완전히 분리
+    1. 파일을 임시 파일로 저장
+    2. job_id 생성 및 상태 저장
+    3. 별도 스레드에서 OCR 처리 시작
+    4. 즉시 응답 반환 (1-2초 내)
     """
-    logger.info(f"SNG OCR Job 요청 수신: filename={file.filename}, content_type={file.content_type}")
+    logger.info(f"SNG OCR Job 요청 수신: filename={file.filename}")
 
     job_id = str(uuid.uuid4())
-    logger.info(f"SNG OCR Job 생성: job_id={job_id}")
 
-    # 파일 읽기
-    image_data = await file.read()
-    logger.info(f"SNG OCR Job {job_id}: 파일 읽기 완료, size={len(image_data)} bytes")
+    # 1. 파일을 임시 파일로 저장 (HTTP 응답 전에 완료해야 함)
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    temp_path = temp_file.name
 
-    # Job 생성
+    try:
+        content = await file.read()
+        temp_file.write(content)
+        temp_file.close()
+        logger.info(f"Job {job_id}: 파일 저장 완료, path={temp_path}, size={len(content)} bytes")
+    except Exception as e:
+        temp_file.close()
+        os.unlink(temp_path)
+        logger.error(f"Job {job_id}: 파일 저장 실패 - {str(e)}")
+        raise HTTPException(status_code=500, detail=f"파일 저장 실패: {str(e)}")
+
+    # 2. Job 생성 (최소 정보만)
     jobs[job_id] = {
         "job_id": job_id,
         "status": "pending",
@@ -212,12 +227,18 @@ async def create_sng_ocr_job(
         "line_item_count": None
     }
 
-    # 백그라운드에서 SNG OCR 처리
-    background_tasks.add_task(process_sng_ocr_job, job_id, image_data)
+    # 3. 별도 스레드에서 OCR 처리 시작 (HTTP 응답과 완전 분리)
+    thread = threading.Thread(
+        target=process_sng_ocr_job_sync,
+        args=(job_id, temp_path),
+        daemon=True
+    )
+    thread.start()
 
-    logger.info(f"SNG OCR Job {job_id}: 응답 반환 (status=pending)")
+    logger.info(f"Job {job_id}: 스레드 시작, 응답 반환 (status=pending)")
 
-    return JobStatus(**jobs[job_id])
+    # 4. 즉시 응답 반환 (최소 payload)
+    return {"job_id": job_id, "status": "pending"}
 
 
 @app.post("/api/v1/ocr/jobs/sync/sng/multi")
@@ -341,20 +362,29 @@ async def process_ocr_job(job_id: str, image_data: bytes):
         })
 
 
-async def process_sng_ocr_job(job_id: str, image_data: bytes):
+def process_sng_ocr_job_sync(job_id: str, temp_path: str):
     """
-    백그라운드에서 SNG OCR 처리
+    별도 스레드에서 SNG OCR 처리 (동기 함수)
+
+    HTTP 응답과 완전히 분리되어 실행됨
     """
     try:
+        logger.info(f"Job {job_id}: OCR 처리 시작")
         jobs[job_id]["status"] = "processing"
 
-        # OCR 처리
-        raw_text = process_image(image_data)
+        # 1. 임시 파일에서 이미지 데이터 읽기
+        with open(temp_path, "rb") as f:
+            image_data = f.read()
+        logger.info(f"Job {job_id}: 이미지 로드 완료, size={len(image_data)} bytes")
 
-        # SNG 파서로 구조화된 데이터 추출
+        # 2. OCR 처리
+        raw_text = process_image(image_data)
+        logger.info(f"Job {job_id}: OCR 완료, text_length={len(raw_text)}")
+
+        # 3. SNG 파서로 구조화된 데이터 추출
         result = parse_sng_invoice(raw_text)
 
-        # 라인 아이템 변환
+        # 4. 라인 아이템 변환
         line_items = [
             {
                 "item_code": item.item_code,
@@ -374,6 +404,7 @@ async def process_sng_ocr_job(job_id: str, image_data: bytes):
             for item in result.line_items
         ]
 
+        # 5. 결과 저장
         jobs[job_id].update({
             "status": "completed",
             "completed_at": datetime.utcnow().isoformat(),
@@ -387,15 +418,23 @@ async def process_sng_ocr_job(job_id: str, image_data: bytes):
             "raw_text": raw_text[:1000] if raw_text else ""
         })
 
-        logger.info(f"SNG OCR Job {job_id} completed: {len(line_items)} items")
+        logger.info(f"Job {job_id}: 완료, {len(line_items)} items 추출")
 
     except Exception as e:
-        logger.error(f"SNG OCR Job {job_id} failed: {str(e)}")
+        logger.error(f"Job {job_id}: 실패 - {str(e)}")
         jobs[job_id].update({
             "status": "failed",
             "completed_at": datetime.utcnow().isoformat(),
             "error": str(e)
         })
+
+    finally:
+        # 6. 임시 파일 삭제
+        try:
+            os.unlink(temp_path)
+            logger.info(f"Job {job_id}: 임시 파일 삭제 완료")
+        except Exception as e:
+            logger.warning(f"Job {job_id}: 임시 파일 삭제 실패 - {str(e)}")
 
 
 # Job cleanup (오래된 작업 삭제)
