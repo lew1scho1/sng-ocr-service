@@ -755,3 +755,364 @@ def _is_color_in_db(color: str, valid_colors: Set[str]) -> bool:
 def _generate_color_variants(color: str) -> List[str]:
     """Deprecated: use generate_color_variants instead"""
     return generate_color_variants(color)
+
+
+# =============================================================================
+# Item Block Detection (점선 기반)
+# =============================================================================
+
+@dataclass
+class BlockRegion:
+    """블록 내 영역 정의"""
+    y_start: int           # 영역 시작 Y
+    y_end: int             # 영역 끝 Y
+    x_start: int = 0       # 영역 시작 X (0 = 전체 폭)
+    x_end: int = 0         # 영역 끝 X (0 = 전체 폭)
+    region_type: str = ""  # "header", "price", "color_row"
+
+
+@dataclass
+class ItemBlock:
+    """인보이스 아이템 블록 (점선 사이 영역)"""
+    index: int              # 블록 순번
+    y_start: int            # 블록 시작 Y 좌표
+    y_end: int              # 블록 끝 Y 좌표
+    height: int             # 블록 높이
+    header_region: Optional[BlockRegion] = None     # 상단 헤더 영역
+    price_region: Optional[BlockRegion] = None      # 가격 영역 (오른쪽)
+    color_row_region: Optional[BlockRegion] = None  # 색상-수량 영역 (하단)
+
+    # OCR 결과
+    header_text: str = ""
+    price_text: str = ""
+    color_row_text: str = ""
+    color_row_confidence: float = 0.0  # 색상 영역 OCR 품질 (재시도 판단용)
+
+
+@dataclass
+class BlockDetectionConfig:
+    """블록 감지 설정"""
+    # 점선 감지 설정
+    dotted_line_min_dots: int = 20        # 최소 도트 수
+    dotted_line_y_tolerance: int = 3       # Y 좌표 허용 오차 (픽셀)
+    dotted_line_min_width_ratio: float = 0.5  # 최소 점선 폭 비율 (이미지 대비)
+
+    # 영역 분할 설정
+    color_row_height_ratio: float = 0.30   # 블록 하단 30% = color_row
+    price_width_ratio: float = 0.25        # 오른쪽 25% = price 영역
+    header_height_ratio: float = 0.35      # 블록 상단 35% = header
+
+    # 최소 블록 크기
+    min_block_height: int = 50             # 최소 블록 높이 (픽셀)
+
+
+DEFAULT_BLOCK_DETECTION_CONFIG = BlockDetectionConfig()
+
+
+@dataclass
+class OcrMethodResult:
+    """OCR 메서드 실행 결과 메타데이터"""
+    method: str                     # "block_ocr" | "color_regions" (fallback)
+    dotted_lines_detected: int      # 감지된 점선 수
+    blocks_created: int             # 생성된 블록 수
+    fallback_reason: Optional[str] = None  # fallback 사유 (있으면)
+    color_row_retries: int = 0      # 색상 행 재시도 횟수
+
+
+def detect_dotted_lines(
+    binary_image_data: List[List[int]],
+    image_width: int,
+    image_height: int,
+    config: BlockDetectionConfig = None
+) -> List[int]:
+    """
+    이진화된 이미지에서 점선 Y 좌표 감지
+
+    점선 특징:
+    - 가로 방향으로 일정 간격의 검은 픽셀 (도트)
+    - 이미지 폭의 50% 이상 차지
+    - 세로 두께 1-5 픽셀
+
+    Args:
+        binary_image_data: 2D 배열 (0=검정, 255=흰색)
+        image_width: 이미지 폭
+        image_height: 이미지 높이
+        config: 감지 설정
+
+    Returns:
+        점선 Y 좌표 리스트 (정렬됨)
+    """
+    if config is None:
+        config = DEFAULT_BLOCK_DETECTION_CONFIG
+
+    dotted_line_ys = []
+    min_width = int(image_width * config.dotted_line_min_width_ratio)
+
+    y = 0
+    while y < image_height:
+        row = binary_image_data[y] if y < len(binary_image_data) else []
+
+        # 검은 픽셀 (도트) 위치 찾기
+        dark_positions = [x for x, pixel in enumerate(row) if pixel < 128]
+
+        if len(dark_positions) >= config.dotted_line_min_dots:
+            # 점들이 이미지 폭의 일정 비율 이상 분포하는지 확인
+            if dark_positions:
+                span = dark_positions[-1] - dark_positions[0]
+
+                if span >= min_width:
+                    # 점선 패턴 확인: 도트 간격이 일정한지
+                    if _is_dotted_pattern(dark_positions):
+                        dotted_line_ys.append(y)
+                        # 같은 점선의 다른 행 건너뛰기
+                        y += config.dotted_line_y_tolerance
+
+        y += 1
+
+    # 인접한 Y 좌표 병합 (같은 점선의 여러 행)
+    merged_ys = _merge_adjacent_ys(dotted_line_ys, config.dotted_line_y_tolerance)
+
+    logger.debug(f"[BlockDetect] 점선 감지: {len(merged_ys)}개 Y좌표")
+    for y in merged_ys:
+        logger.debug(f"  점선 Y={y}")
+
+    return merged_ys
+
+
+def _is_dotted_pattern(positions: List[int], min_gap: int = 3, max_gap: int = 30) -> bool:
+    """
+    위치 목록이 점선 패턴인지 확인
+
+    점선 특징: 도트 간격이 일정 범위 내
+    """
+    if len(positions) < 10:
+        return False
+
+    gaps = []
+    for i in range(1, min(len(positions), 50)):  # 처음 50개만 확인
+        gap = positions[i] - positions[i-1]
+        if gap > 1:  # 연속 픽셀이 아닌 경우만
+            gaps.append(gap)
+
+    if not gaps:
+        return False
+
+    # 갭의 표준편차가 작으면 규칙적인 패턴
+    avg_gap = sum(gaps) / len(gaps)
+    if avg_gap < min_gap or avg_gap > max_gap:
+        return False
+
+    # 일관된 간격인지 확인 (표준편차 작음)
+    variance = sum((g - avg_gap) ** 2 for g in gaps) / len(gaps)
+    std_dev = variance ** 0.5
+
+    return std_dev < avg_gap * 0.5  # 표준편차가 평균의 50% 미만
+
+
+def _merge_adjacent_ys(ys: List[int], tolerance: int) -> List[int]:
+    """인접한 Y 좌표 병합 (같은 점선)"""
+    if not ys:
+        return []
+
+    sorted_ys = sorted(ys)
+    merged = [sorted_ys[0]]
+
+    for y in sorted_ys[1:]:
+        if y - merged[-1] > tolerance:
+            merged.append(y)
+        # 인접하면 건너뜀 (이미 기록됨)
+
+    return merged
+
+
+def create_item_blocks(
+    dotted_line_ys: List[int],
+    image_width: int,
+    image_height: int,
+    config: BlockDetectionConfig = None
+) -> List[ItemBlock]:
+    """
+    점선 Y 좌표로부터 ItemBlock 리스트 생성
+
+    Args:
+        dotted_line_ys: 점선 Y 좌표 리스트
+        image_width: 이미지 폭
+        image_height: 이미지 높이
+        config: 감지 설정
+
+    Returns:
+        ItemBlock 리스트
+    """
+    if config is None:
+        config = DEFAULT_BLOCK_DETECTION_CONFIG
+
+    blocks = []
+
+    # 점선 Y 좌표 정렬
+    sorted_ys = sorted(dotted_line_ys)
+
+    # 첫 점선 위 영역 (헤더 등) - 스킵 또는 별도 처리
+    # 점선 사이 영역을 블록으로
+    for i in range(len(sorted_ys)):
+        y_start = sorted_ys[i]
+        y_end = sorted_ys[i + 1] if i + 1 < len(sorted_ys) else image_height
+
+        height = y_end - y_start
+
+        # 최소 높이 확인
+        if height < config.min_block_height:
+            continue
+
+        block = ItemBlock(
+            index=len(blocks),
+            y_start=y_start,
+            y_end=y_end,
+            height=height
+        )
+
+        # 영역 분할
+        _define_block_regions(block, image_width, config)
+
+        blocks.append(block)
+
+    logger.info(f"[BlockDetect] {len(blocks)}개 아이템 블록 생성")
+    for block in blocks:
+        logger.debug(
+            f"  Block[{block.index}]: y={block.y_start}-{block.y_end}, "
+            f"height={block.height}, color_row={block.color_row_region}"
+        )
+
+    return blocks
+
+
+def _define_block_regions(
+    block: ItemBlock,
+    image_width: int,
+    config: BlockDetectionConfig
+) -> None:
+    """
+    블록 내부 영역 정의 (in-place)
+
+    영역 레이아웃:
+    - Header: 상단 35%
+    - Price: 오른쪽 25% 폭 (전체 높이)
+    - Color Row: 하단 30% (price 영역 제외한 왼쪽)
+    """
+    y_start = block.y_start
+    y_end = block.y_end
+    height = block.height
+
+    # Header 영역 (상단)
+    header_height = int(height * config.header_height_ratio)
+    block.header_region = BlockRegion(
+        y_start=y_start,
+        y_end=y_start + header_height,
+        x_start=0,
+        x_end=image_width,
+        region_type="header"
+    )
+
+    # Price 영역 (오른쪽 컬럼)
+    price_x_start = int(image_width * (1 - config.price_width_ratio))
+    block.price_region = BlockRegion(
+        y_start=y_start,
+        y_end=y_end,
+        x_start=price_x_start,
+        x_end=image_width,
+        region_type="price"
+    )
+
+    # Color Row 영역 (하단, price 영역 왼쪽)
+    color_row_height = int(height * config.color_row_height_ratio)
+    color_row_y_start = y_end - color_row_height
+    block.color_row_region = BlockRegion(
+        y_start=color_row_y_start,
+        y_end=y_end,
+        x_start=0,
+        x_end=price_x_start,  # price 영역 제외
+        region_type="color_row"
+    )
+
+
+# =============================================================================
+# 영역별 OCR 설정
+# =============================================================================
+
+# 색상 행 전용 OCR 설정 (PSM 11 = sparse text)
+COLOR_ROW_OCR_CONFIG = OcrConfig(
+    scale_factor=3.5,               # 높은 확대율 (작은 텍스트)
+    contrast=2.8,                   # 강한 대비
+    threshold=130,                  # 낮은 임계값
+    sharpen_passes=2,
+    psm=11,                         # Sparse text - 흩어진 텍스트에 적합
+    char_whitelist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/-"
+)
+
+# 색상 행 재시도 설정 (PSM 6 = block)
+COLOR_ROW_RETRY_CONFIG = OcrConfig(
+    scale_factor=4.0,               # 더 높은 확대율
+    contrast=3.0,                   # 더 강한 대비
+    threshold=120,
+    sharpen_passes=3,
+    psm=6,                          # Block mode
+    char_whitelist="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/-"
+)
+
+# 헤더 영역 OCR 설정
+HEADER_OCR_CONFIG = OcrConfig(
+    scale_factor=2.5,
+    contrast=2.0,
+    threshold=145,
+    sharpen_passes=1,
+    psm=6,
+    char_whitelist=""  # 전체 문자
+)
+
+# 가격 영역 OCR 설정
+PRICE_OCR_CONFIG = OcrConfig(
+    scale_factor=2.5,
+    contrast=2.2,
+    threshold=140,
+    sharpen_passes=1,
+    psm=6,  # 숫자 컬럼
+    char_whitelist="0123456789.$,"
+)
+
+
+def evaluate_color_row_quality(text: str) -> Tuple[float, int]:
+    """
+    색상 행 OCR 결과 품질 평가
+
+    Returns:
+        (confidence_score, detected_color_qty_pairs)
+    """
+    if not text or not text.strip():
+        return 0.0, 0
+
+    text_upper = text.upper().strip()
+
+    # 색상-수량 패턴 매칭
+    color_qty_pattern = r'([A-Z0-9][A-Z0-9/]*)\s*[-–—]\s*(\d{1,3})'
+    matches = re.findall(color_qty_pattern, text_upper)
+
+    pair_count = len(matches)
+
+    if pair_count == 0:
+        return 0.1, 0
+
+    # 점수 계산
+    # - 패턴 매칭 개수
+    # - 텍스트 길이 대비 패턴 비율
+    base_score = min(1.0, pair_count * 0.2)  # 최대 1.0
+
+    # 텍스트 품질 (의미 있는 문자 비율)
+    valid_chars = sum(1 for c in text_upper if c.isalnum() or c in '-/')
+    char_ratio = valid_chars / len(text_upper) if text_upper else 0
+
+    quality_score = base_score * 0.7 + char_ratio * 0.3
+
+    return quality_score, pair_count
+
+
+# 재시도 임계값
+COLOR_ROW_RETRY_THRESHOLD = 0.3  # 이 점수 미만이면 재시도

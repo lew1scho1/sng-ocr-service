@@ -17,8 +17,11 @@ logger = logging.getLogger(__name__)
 from .ocr_service import (
     process_image,
     extract_barcodes,
-    process_image_with_color_regions
+    process_image_with_color_regions,
+    process_image_with_blocks,
+    process_image_with_blocks_debug,
 )
+from .ocr_models import OcrMethodResult
 from .parsers.sng_parser import parse_sng_invoice, to_dict as sng_to_dict
 
 app = FastAPI(
@@ -201,12 +204,78 @@ async def debug_ocr_sng(file: UploadFile = File(...)):
         }
 
 
+@app.post("/api/v1/ocr/debug/sng/blocks")
+async def debug_ocr_sng_blocks(file: UploadFile = File(...)):
+    """
+    SNG OCR 블록 기반 디버그 엔드포인트
+
+    PHASE 6: 점선 기반 아이템 블록 분리 및 영역별 OCR
+    - dotted_lines: 감지된 점선 Y 좌표
+    - blocks: 각 아이템 블록의 헤더/색상행 OCR 결과
+    - raw_color_rows: 색상 행 OCR 원문
+    - merged_text: 파서 호환 형식으로 병합된 텍스트
+    - parsed_result: 최종 파싱 결과
+    """
+    try:
+        image_data = await file.read()
+
+        # 블록 기반 OCR 디버그
+        debug_result = process_image_with_blocks_debug(image_data)
+
+        # 파싱 (병합된 텍스트로)
+        parsed = None
+        if debug_result['merged_text']:
+            result = parse_sng_invoice(debug_result['merged_text'])
+            parsed = {
+                "header": {
+                    "invoice_number": result.header.invoice_number,
+                    "invoice_date": result.header.invoice_date
+                },
+                "line_items": [
+                    {
+                        "item_code_raw": item.item_code_raw,
+                        "color_raw": item.color_raw,
+                        "quantity": item.quantity,
+                        "unit_price": item.unit_price,
+                        "description_raw": item.description_raw
+                    }
+                    for item in result.line_items
+                ],
+                "line_item_count": len(result.line_items)
+            }
+
+        return {
+            "success": True,
+            "method": "block_based",
+            "debug": {
+                "dotted_lines": debug_result['dotted_lines'],
+                "block_count": len(debug_result['blocks']),
+                "blocks": debug_result['blocks'],
+                "raw_color_rows": debug_result['raw_color_rows'],
+                "merged_text": debug_result['merged_text'],
+                "merged_text_lines": len(debug_result['merged_text'].split('\n')) if debug_result['merged_text'] else 0
+            },
+            "parsed_result": parsed
+        }
+    except Exception as e:
+        logger.error(f"SNG Block Debug OCR Error: {str(e)}")
+        import traceback
+        return {
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+
+
 @app.post("/api/v1/ocr/jobs/sync/sng")
 async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
     """
     SNG (Shake-N-Go) 인보이스 전용 OCR (단일 이미지)
 
-    PHASE 5: 색상-수량 영역 분리 OCR 적용
+    PHASE 6: 점선 기반 아이템 블록 분리 OCR 적용
+    - 점선으로 아이템 블록 경계 감지
+    - 블록별 영역 분리 (헤더/색상행) 및 개별 OCR
+    - 점선 감지 실패 시 기존 color_regions 방식으로 자동 fallback
 
     추출 정보:
     - 헤더: Invoice NO, Invoice Date
@@ -215,9 +284,24 @@ async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
     try:
         image_data = await file.read()
 
-        # OCR 처리 (PHASE 5+: bbox 기반 색상 영역 분리 + block merge)
-        # 새 구현에서는 merged_text가 이미 교체 완료된 텍스트
-        raw_text, color_results = process_image_with_color_regions(image_data)
+        # OCR 처리 (PHASE 6: 블록 기반 영역 분리 OCR)
+        # process_image_with_blocks는 점선 감지 실패 시 자동으로 color_regions 방식으로 fallback
+        raw_text, item_blocks, ocr_method = process_image_with_blocks(image_data)
+
+        # OCR 메서드 로그 (명확한 SUCCESS/FALLBACK 표시)
+        if ocr_method.method == "block_ocr":
+            logger.info(
+                f"[SNG-SYNC] OCR_METHOD=block_ocr | "
+                f"blocks={ocr_method.blocks_created} | "
+                f"dotted_lines={ocr_method.dotted_lines_detected} | "
+                f"retries={ocr_method.color_row_retries}"
+            )
+        else:
+            logger.warning(
+                f"[SNG-SYNC] OCR_METHOD=color_regions (FALLBACK) | "
+                f"reason={ocr_method.fallback_reason} | "
+                f"dotted_lines={ocr_method.dotted_lines_detected}"
+            )
 
         # 디버그: 전체 OCR 텍스트 로그 출력
         logger.info("=" * 80)
@@ -225,7 +309,7 @@ async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
         logger.info("=" * 80)
         logger.info(raw_text)
         logger.info("=" * 80)
-        logger.info(f"SNG OCR - FULL RAW TEXT END (Total: {len(raw_text)} chars, color_regions: {len(color_results)})")
+        logger.info(f"SNG OCR - FULL RAW TEXT END (Total: {len(raw_text)} chars)")
         logger.info("=" * 80)
 
         # SNG 파서로 구조화된 데이터 추출 (raw 데이터만)
@@ -234,6 +318,13 @@ async def create_ocr_job_sync_sng(file: UploadFile = File(...)):
         return {
             "success": True,
             "company": "SNG",
+            "ocr_method": ocr_method.method,
+            "ocr_metadata": {
+                "dotted_lines": ocr_method.dotted_lines_detected,
+                "blocks": ocr_method.blocks_created,
+                "fallback_reason": ocr_method.fallback_reason,
+                "retries": ocr_method.color_row_retries
+            },
             "header": {
                 "invoice_number": result.header.invoice_number,
                 "invoice_date": result.header.invoice_date
@@ -324,7 +415,7 @@ async def create_ocr_job_sync_sng_multi(files: List[UploadFile] = File(...)):
     """
     SNG (Shake-N-Go) 인보이스 전용 OCR (멀티 페이지)
 
-    PHASE 5+: bbox 기반 색상-수량 영역 분리 OCR + block merge 적용
+    PHASE 6: 점선 기반 아이템 블록 분리 OCR 적용
 
     여러 이미지를 순차 처리하여 페이지 간 아이템 연결 지원
     - 페이지 2에서 아이템 코드 없이 색상만 있으면 페이지 1의 마지막 아이템에 연결
@@ -343,10 +434,20 @@ async def create_ocr_job_sync_sng_multi(files: List[UploadFile] = File(...)):
         for i, file in enumerate(files):
             image_data = await file.read()
 
-            # OCR 처리 (PHASE 5+: bbox 기반 색상 영역 분리 + block merge)
-            raw_text, color_results = process_image_with_color_regions(image_data)
+            # OCR 처리 (PHASE 6: 블록 기반 영역 분리 OCR)
+            raw_text, item_blocks, ocr_method = process_image_with_blocks(image_data)
 
-            logger.info(f"SNG OCR - Page {i + 1}/{len(files)}, {len(raw_text)} chars, color_regions: {len(color_results)}")
+            # OCR 메서드 로그
+            if ocr_method.method == "block_ocr":
+                logger.info(
+                    f"[SNG-MULTI] Page {i+1}/{len(files)} | OCR_METHOD=block_ocr | "
+                    f"blocks={ocr_method.blocks_created}"
+                )
+            else:
+                logger.warning(
+                    f"[SNG-MULTI] Page {i+1}/{len(files)} | OCR_METHOD=color_regions (FALLBACK) | "
+                    f"reason={ocr_method.fallback_reason}"
+                )
 
             # SNG 파서로 구조화된 데이터 추출 (이전 페이지 정보 전달)
             result = parse_sng_invoice(raw_text, prev_item_code, prev_unit_price)
@@ -367,7 +468,9 @@ async def create_ocr_job_sync_sng_multi(files: List[UploadFile] = File(...)):
                 "page": i + 1,
                 "filename": file.filename,
                 "item_count": len(result.line_items),
-                "last_item_code_raw": result.last_item_code_raw
+                "last_item_code_raw": result.last_item_code_raw,
+                "ocr_method": ocr_method.method,
+                "blocks_created": ocr_method.blocks_created
             })
 
         return {
@@ -441,7 +544,7 @@ def process_sng_ocr_job_sync(job_id: str, temp_path: str):
 
     HTTP 응답과 완전히 분리되어 실행됨
 
-    PHASE 5+: bbox 기반 색상-수량 영역 분리 OCR + block merge 적용
+    PHASE 6: 점선 기반 아이템 블록 분리 OCR 적용
     """
     try:
         logger.info(f"Job {job_id}: OCR 처리 시작")
@@ -452,9 +555,20 @@ def process_sng_ocr_job_sync(job_id: str, temp_path: str):
             image_data = f.read()
         logger.info(f"Job {job_id}: 이미지 로드 완료, size={len(image_data)} bytes")
 
-        # 2. OCR 처리 (PHASE 5+: bbox 기반 색상 영역 분리 + block merge)
-        raw_text, color_results = process_image_with_color_regions(image_data)
-        logger.info(f"Job {job_id}: OCR 완료, text_length={len(raw_text)}, color_regions={len(color_results)}")
+        # 2. OCR 처리 (PHASE 6: 블록 기반 영역 분리 OCR)
+        raw_text, item_blocks, ocr_method = process_image_with_blocks(image_data)
+
+        # OCR 메서드 로그
+        if ocr_method.method == "block_ocr":
+            logger.info(
+                f"[SNG-ASYNC] Job {job_id} | OCR_METHOD=block_ocr | "
+                f"blocks={ocr_method.blocks_created}"
+            )
+        else:
+            logger.warning(
+                f"[SNG-ASYNC] Job {job_id} | OCR_METHOD=color_regions (FALLBACK) | "
+                f"reason={ocr_method.fallback_reason}"
+            )
 
         # 3. SNG 파서로 구조화된 데이터 추출
         result = parse_sng_invoice(raw_text)

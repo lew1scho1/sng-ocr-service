@@ -14,6 +14,19 @@ from .ocr_models import (
     COLOR_REGION_OCR_CONFIG,
     detect_color_regions_bbox,
     merge_by_replacement,
+    # Block-based detection
+    ItemBlock,
+    BlockRegion,
+    BlockDetectionConfig,
+    DEFAULT_BLOCK_DETECTION_CONFIG,
+    detect_dotted_lines,
+    create_item_blocks,
+    evaluate_color_row_quality,
+    COLOR_ROW_OCR_CONFIG,
+    COLOR_ROW_RETRY_CONFIG,
+    HEADER_OCR_CONFIG,
+    COLOR_ROW_RETRY_THRESHOLD,
+    OcrMethodResult,
 )
 
 # DB 색상 목록 연동
@@ -328,3 +341,371 @@ def ocr_color_region(
         y_end=y_end,
         confidence=0.8  # TODO: Tesseract conf 값 활용
     )
+
+
+# ========================================
+# PHASE 6: Block-based OCR (점선 기반)
+# ========================================
+
+def get_binary_image_data(image: Image.Image) -> List[List[int]]:
+    """
+    PIL Image를 2D 픽셀 배열로 변환
+
+    Args:
+        image: 그레이스케일 이미지 (L 모드)
+
+    Returns:
+        2D 리스트 [y][x] = pixel_value (0-255)
+    """
+    if image.mode != 'L':
+        image = image.convert('L')
+
+    width, height = image.size
+    pixels = list(image.getdata())
+
+    # 2D 배열로 변환
+    return [pixels[y * width:(y + 1) * width] for y in range(height)]
+
+
+def process_image_with_blocks(
+    image_data: bytes,
+    block_config: BlockDetectionConfig = None
+) -> Tuple[str, List[ItemBlock], OcrMethodResult]:
+    """
+    Block-based OCR: 점선 기반 아이템 블록 분리 및 영역별 OCR
+
+    전략:
+    1. 이미지에서 점선 감지 → 아이템 블록 경계 결정
+    2. 각 블록 내 영역 분리 (header, price, color_row)
+    3. color_row 영역에 PSM 11 (sparse text) 적용
+    4. 품질 낮으면 PSM 6으로 재시도
+    5. 기존 파서 호환 형식으로 병합
+
+    Args:
+        image_data: 이미지 바이트 데이터
+        block_config: 블록 감지 설정
+
+    Returns:
+        (병합된_OCR_텍스트, [ItemBlock들], OcrMethodResult)
+    """
+    if block_config is None:
+        block_config = DEFAULT_BLOCK_DETECTION_CONFIG
+
+    # 이미지 로드
+    image = Image.open(io.BytesIO(image_data))
+    original_image = image.copy()
+    width, height = image.size
+    logger.info(f"[BlockOCR] 원본 이미지: {width}x{height}, mode={image.mode}")
+
+    # 1. 전처리 (점선 감지용 - 이진화)
+    preprocessed = preprocess_image(image)
+    binary_data = get_binary_image_data(preprocessed)
+
+    # 점선 좌표를 원본 이미지 기준으로 변환
+    scale_factor = preprocessed.size[0] / width if width > 0 else 1.0
+
+    # 2. 점선 감지
+    dotted_ys = detect_dotted_lines(
+        binary_data,
+        preprocessed.size[0],
+        preprocessed.size[1],
+        block_config
+    )
+
+    # 원본 좌표로 변환
+    dotted_ys_original = [int(y / scale_factor) for y in dotted_ys]
+    logger.info(f"[BlockOCR] 점선 감지: {len(dotted_ys_original)}개")
+
+    # 점선이 없으면 기존 방식으로 폴백
+    if len(dotted_ys_original) < 2:
+        logger.warning("[BlockOCR] FALLBACK - 점선 부족 (dotted_lines < 2)")
+        text, _ = process_image_with_color_regions(image_data)
+        method_result = OcrMethodResult(
+            method="color_regions",
+            dotted_lines_detected=len(dotted_ys_original),
+            blocks_created=0,
+            fallback_reason="dotted_lines_insufficient"
+        )
+        return text, [], method_result
+
+    # 3. 아이템 블록 생성
+    blocks = create_item_blocks(
+        dotted_ys_original,
+        width,
+        height,
+        block_config
+    )
+
+    if not blocks:
+        logger.warning("[BlockOCR] FALLBACK - 블록 생성 실패")
+        text, _ = process_image_with_color_regions(image_data)
+        method_result = OcrMethodResult(
+            method="color_regions",
+            dotted_lines_detected=len(dotted_ys_original),
+            blocks_created=0,
+            fallback_reason="no_valid_blocks"
+        )
+        return text, [], method_result
+
+    # 4. 각 블록의 영역별 OCR (재시도 횟수 추적)
+    total_retries = 0
+    for block in blocks:
+        retried = _ocr_block_regions(original_image, block)
+        if retried:
+            total_retries += 1
+
+    # 5. 파서 호환 텍스트로 병합
+    merged_text = _merge_block_results(blocks)
+
+    # 성공 결과
+    method_result = OcrMethodResult(
+        method="block_ocr",
+        dotted_lines_detected=len(dotted_ys_original),
+        blocks_created=len(blocks),
+        fallback_reason=None,
+        color_row_retries=total_retries
+    )
+
+    logger.info(
+        f"[BlockOCR] SUCCESS - blocks={len(blocks)}, "
+        f"dotted_lines={len(dotted_ys_original)}, retries={total_retries}"
+    )
+
+    return merged_text, blocks, method_result
+
+
+def _ocr_block_regions(image: Image.Image, block: ItemBlock) -> bool:
+    """
+    블록 내 각 영역에 대해 OCR 수행 (in-place)
+
+    Args:
+        image: 원본 이미지
+        block: 처리할 ItemBlock
+
+    Returns:
+        bool: 색상 행 재시도 여부
+    """
+    retried = False
+
+    # Header 영역 OCR
+    if block.header_region:
+        header_text = _ocr_region(image, block.header_region, HEADER_OCR_CONFIG)
+        block.header_text = header_text
+        logger.debug(f"[Block {block.index}] Header: {header_text[:50]}...")
+
+    # Color Row 영역 OCR (핵심)
+    if block.color_row_region:
+        color_text = _ocr_region(image, block.color_row_region, COLOR_ROW_OCR_CONFIG)
+
+        # 품질 평가
+        quality, pair_count = evaluate_color_row_quality(color_text)
+        block.color_row_confidence = quality
+
+        logger.debug(
+            f"[Block {block.index}] ColorRow 1차: quality={quality:.2f}, "
+            f"pairs={pair_count}, text='{color_text[:60]}...'"
+        )
+
+        # 품질 낮으면 재시도
+        if quality < COLOR_ROW_RETRY_THRESHOLD:
+            logger.info(f"[Block {block.index}] ColorRow 재시도 (quality={quality:.2f})")
+            retry_text = _ocr_region(image, block.color_row_region, COLOR_ROW_RETRY_CONFIG)
+            retry_quality, retry_pairs = evaluate_color_row_quality(retry_text)
+            retried = True
+
+            if retry_quality > quality:
+                color_text = retry_text
+                block.color_row_confidence = retry_quality
+                logger.debug(
+                    f"[Block {block.index}] ColorRow 재시도 성공: "
+                    f"quality={retry_quality:.2f}, pairs={retry_pairs}"
+                )
+
+        block.color_row_text = color_text
+
+    return retried
+
+
+def _ocr_region(
+    image: Image.Image,
+    region: BlockRegion,
+    config: OcrConfig
+) -> str:
+    """
+    특정 영역에 대해 OCR 수행
+
+    Args:
+        image: 원본 이미지
+        region: 크롭할 영역
+        config: OCR 설정
+
+    Returns:
+        OCR 텍스트
+    """
+    width, height = image.size
+
+    # 영역 좌표 (전체 폭이면 0, image_width)
+    x_start = region.x_start if region.x_start > 0 else 0
+    x_end = region.x_end if region.x_end > 0 else width
+
+    # 안전한 좌표
+    x_start = max(0, x_start)
+    x_end = min(width, x_end)
+    y_start = max(0, region.y_start)
+    y_end = min(height, region.y_end)
+
+    if x_end <= x_start or y_end <= y_start:
+        return ""
+
+    # 영역 크롭
+    cropped = image.crop((x_start, y_start, x_end, y_end))
+
+    # RGB 변환
+    if cropped.mode != 'RGB':
+        cropped = cropped.convert('RGB')
+
+    # 확대
+    crop_width, crop_height = cropped.size
+    scale = config.scale_factor
+    new_width = int(crop_width * scale)
+    new_height = int(crop_height * scale)
+    cropped = cropped.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+    # 그레이스케일
+    cropped = cropped.convert('L')
+
+    # 대비 강화
+    enhancer = ImageEnhance.Contrast(cropped)
+    cropped = enhancer.enhance(config.contrast)
+
+    # 샤프닝
+    for _ in range(config.sharpen_passes):
+        cropped = cropped.filter(ImageFilter.SHARPEN)
+
+    # 이진화
+    cropped = cropped.point(lambda x: 255 if x > config.threshold else 0, mode='1')
+    cropped = cropped.convert('L')
+
+    # OCR 실행
+    tesseract_config = f'--oem 3 --psm {config.psm}'
+    if config.char_whitelist:
+        tesseract_config += f' -c tessedit_char_whitelist={config.char_whitelist}'
+
+    text = pytesseract.image_to_string(cropped, lang='eng', config=tesseract_config)
+
+    return text.strip()
+
+
+def _merge_block_results(blocks: List[ItemBlock]) -> str:
+    """
+    블록 OCR 결과를 파서 호환 텍스트로 병합
+
+    파서 기대 형식:
+    - 아이템 헤더 라인
+    - 가격 라인
+    - 색상-수량 라인들
+
+    Args:
+        blocks: OCR 완료된 ItemBlock 리스트
+
+    Returns:
+        병합된 텍스트
+    """
+    lines = []
+
+    for block in blocks:
+        # Header (아이템 코드, 설명 포함)
+        if block.header_text:
+            # 헤더 내 각 줄 추가
+            for line in block.header_text.split('\n'):
+                cleaned = line.strip()
+                if cleaned:
+                    lines.append(cleaned)
+
+        # Color Row (색상-수량 데이터)
+        if block.color_row_text:
+            for line in block.color_row_text.split('\n'):
+                cleaned = line.strip()
+                if cleaned:
+                    lines.append(cleaned)
+
+        logger.debug(
+            f"[Merge] Block[{block.index}]: header={len(block.header_text)}chars, "
+            f"color={len(block.color_row_text)}chars"
+        )
+
+    result = '\n'.join(lines)
+    logger.info(f"[BlockMerge] 총 {len(lines)}줄 병합")
+
+    return result
+
+
+def process_image_with_blocks_debug(
+    image_data: bytes,
+    block_config: BlockDetectionConfig = None
+) -> Dict:
+    """
+    Block-based OCR 디버그 버전 - 상세 정보 반환
+
+    Returns:
+        {
+            'merged_text': str,
+            'blocks': [ItemBlock...],
+            'dotted_lines': [int...],
+            'raw_color_rows': [str...]
+        }
+    """
+    if block_config is None:
+        block_config = DEFAULT_BLOCK_DETECTION_CONFIG
+
+    image = Image.open(io.BytesIO(image_data))
+    original_image = image.copy()
+    width, height = image.size
+
+    # 전처리
+    preprocessed = preprocess_image(image)
+    binary_data = get_binary_image_data(preprocessed)
+
+    scale_factor = preprocessed.size[0] / width if width > 0 else 1.0
+
+    # 점선 감지
+    dotted_ys = detect_dotted_lines(
+        binary_data,
+        preprocessed.size[0],
+        preprocessed.size[1],
+        block_config
+    )
+    dotted_ys_original = [int(y / scale_factor) for y in dotted_ys]
+
+    # 블록 생성
+    blocks = []
+    if len(dotted_ys_original) >= 2:
+        blocks = create_item_blocks(
+            dotted_ys_original,
+            width,
+            height,
+            block_config
+        )
+
+        for block in blocks:
+            _ocr_block_regions(original_image, block)
+
+    merged_text = _merge_block_results(blocks) if blocks else ""
+
+    return {
+        'merged_text': merged_text,
+        'blocks': [
+            {
+                'index': b.index,
+                'y_start': b.y_start,
+                'y_end': b.y_end,
+                'height': b.height,
+                'header_text': b.header_text,
+                'color_row_text': b.color_row_text,
+                'color_row_confidence': b.color_row_confidence,
+            }
+            for b in blocks
+        ],
+        'dotted_lines': dotted_ys_original,
+        'raw_color_rows': [b.color_row_text for b in blocks if b.color_row_text]
+    }
